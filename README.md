@@ -192,8 +192,22 @@ You need a Twilio account, a phone number you rent from them, and a public web a
 because Twilio has to reach your machine from the internet. On a laptop that means a tunnel:
 
 ```bash
-ngrok http 8000            # gives you https://something.ngrok-free.app
+./start-tunnel.sh          # free, no account, and it writes the address into .env for you
 ```
+
+That uses Cloudflare, which needs no sign up, unlike ngrok. The address changes every time
+you run it, which is why the script edits `backend/.env` itself. Leave it running while you
+make calls.
+
+Then check the whole setup with:
+
+```bash
+backend/.venv/bin/python backend/check_calling.py
+```
+
+It talks to the real Twilio API and tells you exactly what is still missing, including the
+traps: a trial account that can only call verified numbers, a FROM number you do not own,
+and a number with no voice capability.
 
 Then in `backend/.env`:
 
@@ -201,7 +215,7 @@ Then in `backend/.env`:
 TWILIO_ACCOUNT_SID=ACxxxxxxxx
 TWILIO_AUTH_TOKEN=xxxxxxxx
 TWILIO_FROM_NUMBER=+15551234567
-PUBLIC_BASE_URL=https://something.ngrok-free.app
+PUBLIC_BASE_URL=https://something.trycloudflare.com
 CALL_WEBHOOK_SECRET=any-long-random-string
 ```
 
@@ -218,14 +232,34 @@ their rule, not ours, and the app passes their error through in plain words.
 
 ### WhatsApp setup
 
-The link option needs nothing. The app opens `wa.me` with the number filled in, you press
-call in WhatsApp, and then you share that tab's audio so the app can hear.
+**Use the link option.** It needs nothing at all. The app opens `wa.me` with the number
+filled in, you press call in WhatsApp, and you share that tab's audio so the app can hear
+the client. That is the whole setup, and it is the only WhatsApp path that can cold call.
 
-Calling from inside the app uses the WhatsApp Business Calling API, which needs a Meta
-Business account, a WhatsApp Business number with calling switched on, and the recipient
-consent rules Meta sets. Add `WHATSAPP_TOKEN` and `WHATSAPP_PHONE_ID` to `backend/.env` to
-switch it on. **This path is written but was never tested here, because there are no Meta
-credentials on this machine.** Everything else in this README was run and verified.
+**Calling from inside the app cannot cold call, and that is Meta's rule, not a limitation
+here.** Before reading further, know that this option is a dead end for prospecting. From
+Meta's own documentation:
+
+1. **You must ask for permission first.** A business may not simply dial a WhatsApp user.
+   You send a `call_permission_request` message, and the person has to accept it. A
+   production number may ask **one time per person per day, twice per week**. Cold calling
+   a list is therefore impossible by design.
+2. **Your number needs a 2,000 a day messaging limit.** New numbers start far below that
+   and have to earn their way up through real messaging volume.
+3. **The call is WebRTC.** `POST /{PHONE_NUMBER_ID}/calls` wants an SDP offer, so this needs
+   a full media stack, not an HTTP request. The code here builds the correct request and
+   accepts an `sdp_offer`, but it does not carry a WebRTC stack, so a real connect would be
+   refused by Meta.
+
+Business initiated calling is also switched off entirely in the United States, Canada,
+Egypt, Vietnam and Nigeria. Pakistan is not on that list.
+
+`WHATSAPP_TOKEN` and `WHATSAPP_PHONE_ID` switch the option on if you have all of the above.
+**It was never run against the real API from here, because there are no Meta credentials on
+this machine.** Everything else in this README was run and verified.
+
+The picker in the app says all of this in one line before you press anything, so nobody
+spends a week on Meta Business setup to find out it cannot do the job.
 
 ### What was actually verified
 

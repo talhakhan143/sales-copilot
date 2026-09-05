@@ -7,8 +7,12 @@ them work out of the box, so something has to hold the honest truth about each:
 * ``manual``, the rep dials and the app only listens. Always available, free.
 * ``whatsapp_link``, the app opens WhatsApp with the number already filled in
   and the rep presses the green button. Always available, free.
-* ``whatsapp_cloud``, the app places the WhatsApp call itself. This needs a Meta
-  business number with calling switched on, so it stays off until it is set up.
+* ``whatsapp_cloud``, the app places the WhatsApp call itself. Gated three ways by
+  Meta, and the first gate rules out cold calling entirely: you have to ask the
+  person for call permission and be told yes before you may dial them, and a
+  production number gets one ask per person per day. On top of that the number
+  needs a 2000 a day messaging limit, and the call is WebRTC, so Meta wants an SDP
+  offer rather than a plain request. Use ``whatsapp_link`` to cold call.
 * ``twilio``, the app rings the rep's phone and then bridges the client. This is
   real money per minute, plus a rented number, plus a public URL that Twilio can
   reach from the internet.
@@ -258,8 +262,21 @@ PROVIDERS: list[dict[str, object]] = [
     {
         "key": "whatsapp_cloud",
         "label": "WhatsApp, from the app",
-        "blurb": "The app places the WhatsApp call. Needs a Meta business number.",
-        "cost": "Meta business rates",
+        # Checked against Meta's own docs, not guessed. Three separate walls, and
+        # the first one is the reason this can never do a cold call:
+        #   1. You must ask the person for call permission first, and they must
+        #      say yes. Production accounts get 1 ask per person per day, 2 a week.
+        #   2. Your number needs a 2000 a day messaging limit. A new number starts
+        #      far below that and has to earn its way up.
+        #   3. The call itself is WebRTC. Meta wants an SDP offer, so this needs a
+        #      whole media stack, not just an HTTP request.
+        # Business initiated calling is also off in the US, Canada, Egypt, Vietnam
+        # and Nigeria. Pakistan is fine.
+        "blurb": (
+            "Cannot cold call. WhatsApp makes you ask the person for permission "
+            "first, and they have to say yes."
+        ),
+        "cost": "Meta business rates, and a number that already sends 2000 a day",
         "requires": ("whatsapp_token", "whatsapp_phone_id"),
     },
     {
@@ -656,7 +673,11 @@ if __name__ == "__main__":
     assert _by_key["manual"]["cost"] == "Free"
     assert _by_key["whatsapp_link"]["cost"] == "Free"
     assert "cents a minute" in str(_by_key["twilio"]["cost"])
-    assert "Meta business number" in str(_by_key["whatsapp_cloud"]["blurb"])
+    # The cloud option has to say WHY it cannot be used, not just what is
+    # missing, because the reason is a policy wall and no amount of setting env
+    # vars gets past it.
+    assert "Cannot cold call" in str(_by_key["whatsapp_cloud"]["blurb"])
+    assert "permission" in str(_by_key["whatsapp_cloud"]["blurb"]).lower()
 
     # == readiness, simulated through the environment. Skipped when this machine
     #    already has real telephony settings, because then the "off" state is
@@ -718,6 +739,11 @@ if __name__ == "__main__":
     #    home network addresses matter most: that is the address a laptop shows
     #    a rep who was told the URL has to be public, and a call started on one
     #    is billed by Twilio and then dies.
+    # An empty argument means "test the configured one", so the configured value
+    # has to be out of the way or this loop tests the developer's own tunnel
+    # instead of the strings written below it.
+    _saved_public = settings.public_base_url
+    settings.public_base_url = ""
     for _bad_url in (
         "",
         "   ",
@@ -744,6 +770,7 @@ if __name__ == "__main__":
         "http://255.255.255.255",
     ):
         assert public_base_usable(_bad_url) is False, f"{_bad_url!r} must not count as public"
+    settings.public_base_url = _saved_public
 
     for _good_url in (
         "https://abc123.ngrok-free.app",
