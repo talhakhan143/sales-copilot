@@ -6,9 +6,18 @@ Run it with::
     # or
     .venv/bin/python -m uvicorn app.main:app --reload
 
-The lifespan owns two process wide resources: the shared Groq client, which
-holds the pooled httpx connection, and a background task that sweeps expired
-sessions out of the in memory store.
+The lifespan owns four process wide resources: the shared Groq client, which
+holds the pooled httpx connection, the Twilio and WhatsApp clients, which hold
+one each, and a background task that sweeps expired sessions out of the in
+memory store.
+
+The two calling clients are modules rather than instances, so they are not
+stored on ``app.state`` the way the Groq client is. Their transports are still
+opened and closed here, in the same place and for the same reason: a connection
+pool that outlives the app leaks sockets, and one that is built per request
+throws away every keep alive. Both open even when the provider has no
+credentials, because an idle pool costs nothing and it means adding keys to
+backend/.env is the only step to a working call.
 """
 
 from __future__ import annotations
@@ -23,10 +32,19 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.routes_call import router as call_router
 from app.api.routes_context import router as context_router
 from app.api.routes_practice import router as practice_router
+from app.api.routes_twilio import router as twilio_router
 from app.api.routes_ws import router as ws_router
-from app.config import cors_origin_list, settings
+from app.config import (
+    cors_origin_list,
+    public_wss_base,
+    settings,
+    twilio_ready,
+    whatsapp_cloud_ready,
+)
+from app.services import twilio_client, whatsapp_client
 from app.services.groq_client import GroqClient
 from app.services.session_store import store
 
@@ -64,6 +82,48 @@ async def _sweeper() -> None:
             log.exception("session sweep failed")
 
 
+def _calling_lines() -> list[str]:
+    """Describe the calling providers for the startup banner.
+
+    The banner is where an operator finds out that phone calls are off, so it
+    says so plainly instead of listing values they would have to interpret. No
+    secret is printed, only whether it is present.
+
+    Returns:
+        The banner lines for the calling section.
+    """
+    address = settings.public_base_url.strip()
+    if not public_wss_base():
+        reachable = f"{address} is not reachable from outside" if address else "not set"
+    else:
+        reachable = address
+
+    twilio_line = "ready" if twilio_ready() else "off, needs keys in backend/.env"
+    if whatsapp_cloud_ready():
+        # The keys are there and it still cannot call. A Cloud API call carries
+        # a WebRTC offer this server cannot make, so the button stays off and
+        # the banner says why, rather than promising a call that always fails.
+        cloud_line = "off, the app cannot place a WhatsApp call yet"
+    else:
+        cloud_line = "off, link mode still works"
+
+    # The webhook token is derived from this secret. Leave it empty and a new
+    # one is made at every start, so a call placed before a restart can no
+    # longer reach its own webhooks.
+    if settings.call_webhook_secret.strip():
+        token_line = "pinned by CALL_WEBHOOK_SECRET"
+    else:
+        token_line = "new on every start, set CALL_WEBHOOK_SECRET in backend/.env"
+
+    return [
+        f"  Public address: {reachable}",
+        f"  Twilio call   : {twilio_line}",
+        f"  WhatsApp app  : {cloud_line}",
+        "  WhatsApp link : ready, free",
+        f"  Webhook token : {token_line}",
+    ]
+
+
 def _banner(origins: list[str], groq_configured: bool) -> str:
     """Build the startup banner printed to the console.
 
@@ -91,9 +151,13 @@ def _banner(origins: list[str], groq_configured: bool) -> str:
         f"  Session TTL   : {settings.session_ttl_seconds}s",
         f"  Log level     : {settings.log_level}",
         rule,
+        *_calling_lines(),
+        rule,
         "  REST      http://127.0.0.1:8000/api/health",
         "  Docs      http://127.0.0.1:8000/docs",
+        "  Providers http://127.0.0.1:8000/api/call/providers",
         "  WebSocket ws://127.0.0.1:8000/ws/teleprompter?session_id=<uuid>",
+        "  Twilio    POST /twilio/voice/<session_id>, media on /ws/twilio",
         rule,
         "",
     ]
@@ -102,7 +166,7 @@ def _banner(origins: list[str], groq_configured: bool) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Start and stop the shared Groq client and the session sweeper.
+    """Start and stop the shared clients and the session sweeper.
 
     Args:
         app: The FastAPI application being started.
@@ -118,6 +182,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     await groq.startup()
     app.state.groq = groq
+
+    await twilio_client.startup()
+    await whatsapp_client.startup()
 
     sweeper_task = asyncio.create_task(_sweeper(), name="session-sweeper")
     app.state.sweeper = sweeper_task
@@ -138,20 +205,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # asyncio.wait, not "suppress(CancelledError): await sweeper_task".
             # Awaiting a cancelled task directly raises CancelledError here, and
             # suppressing it would also swallow a cancellation aimed at the
-            # lifespan itself. The inner finally keeps the client teardown
-            # unconditional either way.
+            # lifespan itself. The nested finally blocks keep every client
+            # teardown unconditional either way, so one that fails cannot leave
+            # the other one open.
             await asyncio.wait({sweeper_task})
         finally:
-            await groq.shutdown()
-            log.info("shutdown complete")
+            try:
+                await twilio_client.shutdown()
+            finally:
+                try:
+                    await whatsapp_client.shutdown()
+                finally:
+                    await groq.shutdown()
+                    log.info("shutdown complete")
 
 
 app = FastAPI(
     title=API_TITLE,
     version=API_VERSION,
     description=(
-        "Realtime cold call copilot. Prepare a call context over REST, then stream "
-        "raw PCM into the teleprompter WebSocket and read the suggestions aloud."
+        "Realtime cold call copilot. Prepare a call context over REST, place the "
+        "call through one of four providers, then stream raw PCM into the "
+        "teleprompter WebSocket and read the suggestions aloud."
     ),
     lifespan=lifespan,
 )
@@ -166,6 +241,8 @@ app.add_middleware(
 
 app.include_router(context_router)
 app.include_router(practice_router)
+app.include_router(call_router)
+app.include_router(twilio_router)
 app.include_router(ws_router)
 
 
@@ -208,5 +285,6 @@ async def root() -> dict[str, str]:
         "version": API_VERSION,
         "docs": "/docs",
         "health": "/api/health",
+        "providers": "/api/call/providers",
         "websocket": "/ws/teleprompter?session_id=<uuid>",
     }

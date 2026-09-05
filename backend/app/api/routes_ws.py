@@ -20,6 +20,20 @@ The same socket also serves practice mode, chosen by ``session.mode``. There the
 prospect is not on the line at all: the server writes the client's lines with a
 persona model, the browser speaks them out loud, and the REP stream is what
 drives the call forward. The live path above is untouched by that branch.
+
+Two doors are open to the rest of the app, both keyed by session id through a
+small registry of live sockets. :func:`feed_call_audio` lets the phone routes
+push already decoded audio into the SAME segmenters, the same utterance queue
+and the same Whisper worker the browser feeds, so the phone lane duplicates
+nothing. :func:`notify_call_state` lets them push the phone call's own state
+down to the browser. Both are quiet no ops when no browser is connected.
+
+Because both doors lead to one segmenter per lane, the phone wins while it is
+carrying the call. A live Twilio call forks both sides to us, so browser audio
+is refused at the door for the whole time, and the browser is told once why. See
+:data:`PHONE_AUDIO_PROVIDERS`. Without that the rep's own voice would reach one
+segmenter twice, once from the microphone and once, a moment later, over the
+phone line, and the transcript would come back as chopped nonsense.
 """
 
 from __future__ import annotations
@@ -84,6 +98,30 @@ MAX_NOTE_CHARS = 1000
 #: How often the same "no API key" complaint may be repeated, in seconds.
 NO_KEY_NOTICE_INTERVAL_S = 15.0
 
+#: Call providers that fork the live call audio into our own pipeline.
+#:
+#: Twilio is the only one. Its TwiML asks for ``track="both_tracks"``, so once
+#: the media socket is up BOTH of our lanes are being filled by the phone. The
+#: other three providers never send us a byte: ``manual`` and ``whatsapp_link``
+#: are the rep dialling on their own phone, and the WhatsApp Cloud API places
+#: the call but does not stream it here. For those the browser stays the only
+#: source of audio, exactly as it was before calling existed.
+PHONE_AUDIO_PROVIDERS: frozenset[str] = frozenset({"twilio"})
+
+#: Call states in which that fork is actually running.
+#:
+#: The media socket sets ``live`` on its ``start`` frame, before the first byte
+#: of audio is decoded, so this flips at the right moment. ``dialing`` and
+#: ``ringing`` are deliberately out: nothing is flowing yet, so the rep can
+#: still use the browser lanes while the phone rings.
+PHONE_AUDIO_STATES: frozenset[str] = frozenset({"live"})
+
+#: Said once when browser audio is refused because the phone is carrying it.
+_PHONE_AUDIO_NOTICE = (
+    "The phone call is sending the sound now. Your microphone and the shared "
+    "tab are not used while the call is on. You can stop them."
+)
+
 #: Message ids must be monotonic per session, and a session outlives its
 #: socket (a reconnect resumes the same call), so the counter lives here
 #: keyed by session id instead of on the connection object.
@@ -91,6 +129,14 @@ _ID_COUNTERS: dict[str, int] = {}
 
 #: Hard cap so a long lived server cannot accumulate counters forever.
 _ID_COUNTER_CAP = 1024
+
+#: Every teleprompter socket that is open right now, by session id. It is what
+#: lets the phone routes reach a browser they hold no reference to. A session
+#: has at most one socket, so a reconnect simply replaces the entry, and a
+#: socket only ever removes its own entry on the way out. Filled in
+#: :meth:`TeleprompterConnection.run` and cleared in its finally block, so an
+#: id in here always means a socket that was accepted and is not torn down yet.
+_CONNECTIONS: dict[str, TeleprompterConnection] = {}
 
 #: Fallback practice level when the session carries none.
 DEFAULT_DIFFICULTY = "normal"
@@ -297,6 +343,15 @@ class TeleprompterConnection:
         self._overruns = 0
         self._id_counter = _ID_COUNTERS.get(session.id, 0)
 
+        # Phone lane state. All of it is inert unless a provider that forks
+        # audio to us, which today means Twilio, is actually live.
+        # True while the phone is the one filling the lanes. It tracks the
+        # EDGE, the per frame gate reads the session itself, so a state change
+        # that arrives while frames are in flight can never be missed.
+        self._phone_feeding = False
+        self._phone_audio_noticed = False
+        self._phone_muted_frames = 0
+
         # Practice mode state. All of it is inert on a live call.
         self._practice_started = False
         self._practice_over = False
@@ -318,8 +373,21 @@ class TeleprompterConnection:
         The receive loop runs on the calling task while a second task drains
         the utterance queue. Whatever happens, the finally block cancels both
         the worker and the LLM task and empties the queue.
+
+        The connection is published in :data:`_CONNECTIONS` as soon as the
+        socket is accepted, so a phone call that rings before the first frame
+        arrives can still report its state, and it is withdrawn in the finally
+        block. Registration happens after ``accept`` on purpose: a socket that
+        was never accepted cannot be sent anything.
+
+        A session outlives its socket and a phone call outlives it too, so the
+        current call state is replayed right after ``ready``. Without that a
+        refresh in the middle of a paid Twilio call shows an idle chip, hides
+        the Hang up button, and re arms Start, so the rep's next press bills a
+        second call while the first one is still up.
         """
         await self._ws.accept()
+        _CONNECTIONS[self._session.id] = self
         self._worker_task = asyncio.create_task(self._worker(), name="utterance-worker")
         try:
             await self._send(
@@ -336,6 +404,11 @@ class TeleprompterConnection:
                 }
             )
             await self._status("idle")
+            # Only when there is something to say. A call_state frame for an
+            # idle session would tell the browser nothing it does not already
+            # assume, and this replay must not look like a new call starting.
+            if self._call_state != "idle":
+                await self.send_call_state(self._session.call_snapshot())
             if not self._groq.configured:
                 await self._notify_missing_key(force=True)
             await self._recv_loop()
@@ -352,8 +425,15 @@ class TeleprompterConnection:
 
         The session itself is deliberately left in the store so a reconnect
         resumes the same call with its transcript intact.
+
+        The registry entry is only dropped when it still points at this
+        connection. A reconnect on the same session id registers the new socket
+        before the old one finishes tearing down, and a blind pop there would
+        delete the live socket and leave the browser deaf to call state.
         """
         self._closed = True
+        if _CONNECTIONS.get(self._session.id) is self:
+            del _CONNECTIONS[self._session.id]
         await self._cancel_llm()
 
         worker = self._worker_task
@@ -378,10 +458,12 @@ class TeleprompterConnection:
             drained += 1
 
         log.info(
-            "session %s socket closed, dropped %d pending utterances, %d overruns",
+            "session %s socket closed, dropped %d pending utterances, %d overruns, "
+            "%d browser frames refused while the phone carried the sound",
             self._session.id,
             drained,
             self._overruns,
+            self._phone_muted_frames,
         )
 
     async def _recv_loop(self) -> None:
@@ -422,7 +504,10 @@ class TeleprompterConnection:
         chunk holding more audio than ``max_utterance_ms`` drives the VAD force
         split into re emitting a multi megabyte utterance on every push.
 
-        In practice mode a frame can also be dropped on purpose, see
+        A frame can also be dropped on purpose twice over. While the phone is
+        carrying the call the browser is not a source at all, see
+        :meth:`_phone_owns_audio`, and in practice mode the microphone is gated
+        while the browser speaks the client line, see
         :meth:`_practice_accepts_audio`.
 
         Args:
@@ -454,29 +539,114 @@ class TeleprompterConnection:
                 )
                 return
 
+            if self._phone_owns_audio:
+                # The phone is filling both lanes already. Letting this frame
+                # in would put the same voice into one segmenter twice, once
+                # from the room and once, a fraction of a second later, off the
+                # line. Checked per frame against the session, so the moment a
+                # call goes live the browser stops being a source, even if it
+                # is mid capture and has not been told yet.
+                self._phone_muted_frames += 1
+                await self._notify_phone_audio()
+                return
+
             if self._practice and not await self._practice_accepts_audio(stream):
                 return
 
-            pcm = data[1:]
-            if len(pcm) % 2:
-                # An odd byte count would shift every following sample by one
-                # byte and turn the audio into noise, so drop the stray byte.
-                pcm = pcm[:-1]
-            if not pcm:
-                return
-
-            segmenter = self._segmenters[stream]
-            events = segmenter.push(pcm)
-            await self._emit_vad(stream, segmenter.speaking, segmenter.last_rms)
-
-            for event in events:
-                if event.kind == "utterance" and event.pcm:
-                    await self._enqueue(stream, event.pcm)
-                elif event.kind == "speech_start" and stream == "client":
-                    await self._status("listening")
+            await self._ingest_pcm(stream, data[1:])
         except Exception as exc:  # noqa: BLE001 - one bad frame must not close the call.
             log.exception("binary frame failed on session %s", self._session.id)
             await self._send({"type": "error", "code": "internal", "message": str(exc)})
+
+    async def _ingest_pcm(self, stream: StreamName, pcm: bytes) -> bool:
+        """Push one lane's PCM through the VAD and on to the utterance queue.
+
+        This is the only door audio walks through. The browser reaches it from
+        :meth:`_handle_binary` and the phone from :meth:`ingest_phone_audio`,
+        which is what keeps the VAD, the queue, the Whisper worker and the
+        copilot single copies instead of one set per source.
+
+        Args:
+            stream: Which lane this audio belongs to.
+            pcm: Int16 LE mono PCM at 16 kHz, no stream byte.
+
+        Returns:
+            True when the audio was segmented, False when the frame held
+            nothing usable.
+        """
+        if len(pcm) % 2:
+            # An odd byte count would shift every following sample by one
+            # byte and turn the audio into noise, so drop the stray byte.
+            pcm = pcm[:-1]
+        if not pcm:
+            return False
+
+        segmenter = self._segmenters[stream]
+        events = segmenter.push(pcm)
+        await self._emit_vad(stream, segmenter.speaking, segmenter.last_rms)
+
+        for event in events:
+            if event.kind == "utterance" and event.pcm:
+                await self._enqueue(stream, event.pcm)
+            elif event.kind == "speech_start" and stream == "client":
+                await self._status("listening")
+        return True
+
+    async def ingest_phone_audio(self, stream: StreamName, pcm: bytes) -> bool:
+        """Feed one frame of phone audio into this socket's own pipeline.
+
+        This is the door the phone routes come in through. A carrier hands them
+        8 kHz mu-law, they decode it to the same Int16 LE 16 kHz PCM the browser
+        worklet sends, then call this. From here nothing is duplicated: the same
+        segmenter, the same utterance queue, the same Whisper worker and the
+        same copilot task the browser drives.
+
+        Be careful about the lane, it is the easiest thing to invert. ``stream``
+        is OUR lane name, ``"client"`` or ``"rep"``, not the carrier's track
+        name. On a Twilio call the leg is the rep's phone, so Twilio's
+        ``outbound`` track carries the client and its ``inbound`` track carries
+        the rep. The caller owns that mapping, because the caller is the only
+        place that knows which leg was dialled.
+
+        A lane is shared with the browser, it is not split, so the two sources
+        must never run at once or one segmenter hears the same person twice.
+        That is not left to good manners on either side. While the call is live
+        :meth:`_phone_owns_audio` is true, so :meth:`_handle_binary` refuses
+        every browser frame for this session and tells the browser once why.
+
+        Args:
+            stream: ``"client"`` or ``"rep"``, our lane, already mapped.
+            pcm: Int16 LE mono PCM at 16 kHz. A stray odd byte is dropped.
+
+        Returns:
+            True when the audio reached the VAD. False when it was dropped,
+            which happens when the socket is closing, when the frame is over
+            :data:`MAX_AUDIO_FRAME_BYTES`, when there is nothing usable in it,
+            or when this is a practice session, which has no phone call at all.
+        """
+        if self._closed:
+            return False
+        if len(pcm) > MAX_AUDIO_FRAME_BYTES:
+            # Same ceiling as a browser frame, and for the same reason: the RMS
+            # loop is pure Python and the VAD force split must never be handed
+            # more audio than one whole utterance. Logged, not sent, because a
+            # bad phone frame is not the browser's fault to read about.
+            log.warning(
+                "phone frame of %d bytes dropped on session %s, the limit is %d",
+                len(pcm),
+                self._session.id,
+                MAX_AUDIO_FRAME_BYTES,
+            )
+            return False
+        if self._practice:
+            # A practice call has no line and no prospect. Letting real audio in
+            # would have the written client answering a real voice.
+            return False
+        try:
+            return await self._ingest_pcm(stream, pcm)
+        except Exception:  # noqa: BLE001 - one bad frame must not close the call.
+            log.exception("phone frame failed on session %s", self._session.id)
+            return False
 
     async def _handle_text(self, raw: str) -> None:
         """Decode and dispatch one JSON control frame.
@@ -566,6 +736,10 @@ class TeleprompterConnection:
         names: list[StreamName] = all_names if target == "all" else [_as_stream(target)]
 
         if action == "start":
+            if self._phone_owns_audio:
+                # Say it at the moment the rep opens the lane, not one frame
+                # later. The frames are refused either way.
+                await self._notify_phone_audio()
             for name in names:
                 self._segmenters[name].reset()
                 self._last_speaking[name] = False
@@ -1457,6 +1631,108 @@ class TeleprompterConnection:
         )
 
     # ================================================================== #
+    # phone lane
+    # ================================================================== #
+
+    @property
+    def _call_provider(self) -> str:
+        """Return how this call is being placed.
+
+        Returns:
+            The provider key, ``"manual"`` for a session made before calling
+            existed, which is what every session did before this feature.
+        """
+        return str(getattr(self._session, "call_provider", "manual") or "manual")
+
+    @property
+    def _call_state(self) -> str:
+        """Return where the phone call is right now.
+
+        Returns:
+            One of the six states in ``session_store.CallState``, ``"idle"``
+            when the session carries none.
+        """
+        return str(getattr(self._session, "call_state", "idle") or "idle")
+
+    @property
+    def _phone_owns_audio(self) -> bool:
+        """Report whether the phone is the only source of audio right now.
+
+        This is the whole rule in one place. When a provider that forks the
+        call to us is live, both lanes are already being filled through
+        :meth:`ingest_phone_audio`, so the browser must stop being a source.
+        The rep will not think of it themselves: the app has always taught them
+        to open the microphone first, and their own voice arrives on the line a
+        few hundred milliseconds after it arrives in the room, so the rep lane
+        would hold one sentence twice, shuffled. Whisper turns that into mush,
+        the mush is kept as rep context, and it then biases every later
+        transcription on both lanes.
+
+        Practice is excluded for the same reason :meth:`ingest_phone_audio`
+        excludes it. A practice call has no line, nothing can be feeding us, and
+        blocking the microphone there would break the rehearsal.
+
+        Returns:
+            True while the phone is carrying the sound for this session.
+        """
+        if self._practice:
+            return False
+        return (
+            self._call_provider in PHONE_AUDIO_PROVIDERS
+            and self._call_state in PHONE_AUDIO_STATES
+        )
+
+    async def _notify_phone_audio(self) -> None:
+        """Tell the browser once that the phone is carrying the sound.
+
+        A capture sends about thirty frames a second, so this can never be sent
+        per refused frame. The latch is cleared in
+        :meth:`_sync_phone_audio_gate` when the call stops feeding us, so the
+        next call says it again.
+        """
+        if self._phone_audio_noticed:
+            return
+        self._phone_audio_noticed = True
+        await self._send(
+            {
+                "type": "error",
+                "code": "phone_audio_active",
+                "message": _PHONE_AUDIO_NOTICE,
+            }
+        )
+
+    async def _sync_phone_audio_gate(self) -> None:
+        """Close both lanes cleanly across the edge where the source changes.
+
+        Called on every call state change. On the way in the segmenters may
+        hold half an utterance of microphone audio, and on the way out half an
+        utterance of phone audio, and a segmenter simply glues whatever it is
+        pushed next onto that tail. Left alone, the rep's last words before the
+        call connected would come back stuck to the client's first words on the
+        line. So both lanes are flushed on both edges, which sends the half
+        utterance to Whisper on its own and starts the new source clean.
+
+        Nothing happens on a provider that does not fork audio to us, and
+        nothing happens in practice mode, because the flag never flips there.
+        """
+        feeding = self._phone_owns_audio
+        if feeding == self._phone_feeding:
+            return
+        self._phone_feeding = feeding
+        if not feeding:
+            # The line is free again, so the browser is a source once more and
+            # the notice is due again on the next call.
+            self._phone_audio_noticed = False
+
+        names: tuple[StreamName, StreamName] = ("client", "rep")
+        for name in names:
+            for event in self._segmenters[name].flush():
+                if event.kind == "utterance" and event.pcm:
+                    await self._enqueue(name, event.pcm)
+            self._last_speaking[name] = False
+            await self._emit_vad(name, False, 0.0, force=True)
+
+    # ================================================================== #
     # outbound helpers
     # ================================================================== #
 
@@ -1538,6 +1814,33 @@ class TeleprompterConnection:
         self._last_no_key_notice = now
         await self._send({"type": "error", "code": "no_api_key", "message": _NO_KEY_MESSAGE})
 
+    async def send_call_state(self, payload: Mapping[str, Any]) -> None:
+        """Push one phone call state change down to the browser.
+
+        Public because the phone routes reach it through
+        :func:`notify_call_state`. It writes through the same send lock as every
+        other message, so it can never interleave with a streaming suggestion,
+        and it is not gated by :meth:`_status`: call state is not copilot state,
+        so a suggestion in flight must not hide the fact that the line dropped.
+
+        This is also the moment the audio source can change hands, so the lane
+        gate is resynced right after the frame goes out. The gate itself reads
+        the session, not this payload, so a caller that changed the session and
+        then sent a different payload cannot desync the two.
+
+        Args:
+            payload: The call fields, normally ``provider``, ``state``,
+                ``callId`` and ``detail``. A ``type`` key inside it is ignored,
+                this message is always ``call_state``.
+        """
+        message: dict[str, Any] = {"type": "call_state"}
+        for key, value in payload.items():
+            if key == "type":
+                continue
+            message[str(key)] = value
+        await self._send(message)
+        await self._sync_phone_audio_gate()
+
     async def _send(self, payload: dict[str, Any]) -> None:
         """Serialize and send one JSON message, serialized by a lock.
 
@@ -1574,6 +1877,85 @@ class TeleprompterConnection:
             _ID_COUNTERS.clear()
         _ID_COUNTERS[self._session.id] = self._id_counter
         return str(self._id_counter)
+
+
+# ====================================================================== #
+# the doors other modules use
+# ====================================================================== #
+
+
+def teleprompter_attached(session_id: str) -> bool:
+    """Report whether a browser is watching this session right now.
+
+    The phone routes use this to stay honest. If nobody is connected there is
+    no point telling the rep that the teleprompter is following the call.
+
+    Args:
+        session_id: The session to look up.
+
+    Returns:
+        True when a teleprompter socket is open for that session.
+    """
+    return session_id in _CONNECTIONS
+
+
+async def notify_call_state(session_id: str, payload: Mapping[str, Any]) -> None:
+    """Tell the browser that the phone call changed state.
+
+    Sent as ``{"type": "call_state", ...}`` with the caller's fields merged in,
+    normally ``provider``, ``state``, ``callId`` and ``detail``. This is a
+    fire and forget helper for the phone routes, so it does two things very
+    deliberately: it is a plain no op when no browser is connected, and it never
+    lets an error out. A webhook from a carrier must not fail because the rep
+    closed their tab.
+
+    Args:
+        session_id: Which session the phone call belongs to.
+        payload: The call fields to send.
+    """
+    connection = _CONNECTIONS.get(session_id)
+    if connection is None:
+        return
+    try:
+        await connection.send_call_state(payload)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a dead socket must not break a webhook.
+        log.debug("call_state push failed on session %s", session_id, exc_info=True)
+
+
+async def feed_call_audio(session_id: str, stream: StreamName, pcm: bytes) -> bool:
+    """Push one frame of phone audio into a session's live pipeline.
+
+    The phone routes hold no reference to the socket, they only know the session
+    id, so this looks the connection up and hands the frame to
+    :meth:`TeleprompterConnection.ingest_phone_audio`. Everything downstream is
+    the browser's pipeline, unchanged.
+
+    ``stream`` is our lane name and the caller has already mapped the carrier's
+    track name onto it. See :meth:`TeleprompterConnection.ingest_phone_audio`
+    for why that mapping is not obvious.
+
+    Args:
+        session_id: Which session this audio belongs to.
+        stream: ``"client"`` or ``"rep"``, our lane.
+        pcm: Int16 LE mono PCM at 16 kHz, already decoded from mu-law.
+
+    Returns:
+        True when the audio reached the VAD, False when it was dropped. The
+        common false is simply that no browser is connected yet, which is not an
+        error, so the caller should count it rather than raise on it.
+    """
+    connection = _CONNECTIONS.get(session_id)
+    if connection is None:
+        return False
+    try:
+        return await connection.ingest_phone_audio(stream, pcm)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a dead socket must not break the media stream.
+        log.debug("phone audio push failed on session %s", session_id, exc_info=True)
+        return False
 
 
 @router.websocket("/ws/teleprompter")

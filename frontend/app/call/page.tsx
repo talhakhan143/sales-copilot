@@ -19,15 +19,34 @@
  * a synthetic client lane in the wave, and the score card overlay at the end.
  * Every one of them is behind a guard, so a real call renders exactly the DOM it
  * rendered before practice mode existed.
+ *
+ * CALLING (CONTRACT_CALLING.md section 5)
+ *
+ * The top bar also places the call. A CALL popover sits next to SOURCES, with a
+ * state chip beside it that appears only once the call is doing something. This
+ * screen owns the provider list, the two phone numbers, the busy flag and the
+ * last message, and the launcher only draws them. The state itself is not owned
+ * here: it arrives on the socket as a call_state frame and comes out of the
+ * hook, so the chip and the popover can never disagree with the server.
+ *
+ * That frame is pushed only when the call MOVES, so this screen also reads
+ * GET /api/call/{id}/status once when it opens and hands the answer to the hook,
+ * into the very same place. That one read is what brings the chip and the
+ * launcher back for a rep who reloaded the page in the middle of a live call,
+ * and it is what stops them being offered a second call they would pay for.
+ *
+ * In practice mode none of it is mounted. There is nobody on the other end of a
+ * rehearsal, so a Call button there would be a button that cannot call.
  */
 
 import { Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { ArrowLeft, Check, Copy, ScrollText, Send, X } from "lucide-react";
+import { ArrowLeft, Check, Copy, ExternalLink, ScrollText, Send, X } from "lucide-react";
 
 import { AudioSourcePicker } from "@/components/AudioSourcePicker";
+import { CallLauncher, CallStateChip } from "@/components/CallLauncher";
 import { Debrief } from "@/components/Debrief";
 import { LatencyMeter } from "@/components/LatencyMeter";
 import { ObjectionBar } from "@/components/ObjectionBar";
@@ -36,10 +55,14 @@ import { StatusPill } from "@/components/StatusPill";
 import { Teleprompter } from "@/components/Teleprompter";
 import { TranscriptRail } from "@/components/TranscriptRail";
 import { WaveVisualizer } from "@/components/WaveVisualizer";
+import { fetchProviders, hangUp, startCall } from "@/lib/calling";
 import { useTeleprompter } from "@/lib/hooks/useTeleprompter";
+import type { CallSnapshot, StreamFlags } from "@/lib/hooks/useTeleprompter";
 import { SESSION_STORAGE_KEY, loadSession } from "@/lib/session";
-import { isDebrief, isDifficulty } from "@/lib/types";
+import { isCallProvider, isCallState, isDebrief, isDifficulty } from "@/lib/types";
 import type {
+  CallProvider,
+  CallProviderInfo,
   Debrief as DebriefData,
   Difficulty,
   PreparedSession,
@@ -88,6 +111,17 @@ const SYNTHETIC_LEVEL_MS = 80;
  * listening rather than watching.
  */
 const STEADY_CLIENT_LEVEL = 0.5;
+
+/**
+ * Both lanes plugged in, for a call the server is carrying by itself.
+ *
+ * The wave dims a lane and throws its history away when nothing is plugged into
+ * it. On a phone call the browser has plugged nothing in and never will, yet the
+ * bars are moving, because the server is pushing the phone's own levels down the
+ * same socket. Without this the instrument would draw two dead lanes over live
+ * measured audio, which is the one lie it is built never to tell.
+ */
+const PHONE_LANES: StreamFlags = { client: true, rep: true };
 
 /**
  * The keys the call screen answers from anywhere on the page: the eight
@@ -184,6 +218,155 @@ function readStoredPractice(): StoredPractice | null {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* The two phone numbers                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Where the rep's own phone number is remembered.
+ *
+ * It is theirs, it is the same every day, and typing a phone number on a laptop
+ * one minute before a cold call is exactly the friction worth removing.
+ *
+ * The CLIENT's number is deliberately never written here. It belongs to somebody
+ * else, this browser is often shared, and it changes with every call. It comes
+ * from the call the rep set up instead, which they can clear from the setup page
+ * along with the rest of the session.
+ */
+const REP_NUMBER_KEY = "salescopilot:repNumber";
+
+/** The saved rep number, or an empty string when there is none to read. */
+function readRepNumber(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(REP_NUMBER_KEY)?.trim() ?? "";
+  } catch {
+    // Reading storage itself throws in a private window. No saved number then.
+    return "";
+  }
+}
+
+/** Remember the rep number, or forget it when the box is emptied. */
+function writeRepNumber(value: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) window.localStorage.removeItem(REP_NUMBER_KEY);
+    else window.localStorage.setItem(REP_NUMBER_KEY, trimmed);
+  } catch {
+    // Storage is off in this browser. The field still works for this call, it
+    // just will not be filled in for the next one.
+  }
+}
+
+/**
+ * The client number the rep typed on the setup page, for THIS call.
+ *
+ * loadSession() normalises a stored record down to the fields lib/types.ts
+ * declares and drops everything else, so this reads the stored JSON itself, the
+ * same way the practice flag above is read. The id is checked because a number
+ * saved with last week's call must never end up in the dialler for this one.
+ */
+function readStoredClientNumber(sessionId: string): string {
+  if (typeof window === "undefined") return "";
+
+  let raw: string | null = null;
+  try {
+    raw = window.localStorage.getItem(SESSION_STORAGE_KEY);
+  } catch {
+    return "";
+  }
+  if (!raw) return "";
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "";
+  }
+  if (typeof parsed !== "object" || parsed === null) return "";
+
+  const record = parsed as Record<string, unknown>;
+  if (record.sessionId !== sessionId) return "";
+  return typeof record.clientPhone === "string" ? record.clientPhone.trim() : "";
+}
+
+/**
+ * The receipt for the last call action, which has nowhere else to live.
+ *
+ * The launcher draws failures, because a failure is fixed inside the popover: a
+ * missing variable, a number with no country code. It does not draw the success
+ * line, and the success line is the one that has to survive the popover closing.
+ * In WhatsApp link mode it is read in a different tab, after the rep has already
+ * left this one, and it is the line that tells them to come back and share that
+ * tab's sound. So the screen keeps it, under the bar.
+ */
+interface CallNote {
+  /** One or two plain sentences. */
+  text: string;
+  /** The WhatsApp link, kept so a blocked pop up is still reachable. */
+  openUrl: string | null;
+}
+
+/** A failure and its fix, as one line. Both come from lib/calling.ts already. */
+function withHint(message: string, hint: string | null): string {
+  return hint ? `${message} ${hint}` : message;
+}
+
+/**
+ * Where the phone call is right now, read once when this screen opens.
+ *
+ * GET /api/call/{id}/status, through the proxy route, the same way every other
+ * backend read in this app goes.
+ *
+ * WHY IT IS HERE. The server pushes a call_state frame only when the call
+ * MOVES. A rep who reloads this page in the middle of a live call, or opens it
+ * in a second tab, would therefore be told nothing at all until the call ends:
+ * no chip in the bar, and a launcher offering to start a call that is already
+ * running. On Twilio that is a second call the rep pays for. One read on open
+ * closes that hole, and the socket covers every change after it.
+ *
+ * Nothing here throws and nothing here is shown as an error. When the answer
+ * does not arrive the page simply keeps the idle snapshot it started with,
+ * which is exactly what it had before this read existed, and the launcher
+ * already says its own piece when the backend is down. Every field is checked,
+ * because an unknown state would put a word in the top bar that means nothing.
+ */
+async function readCallStatus(
+  sessionId: string,
+  signal: AbortSignal,
+): Promise<CallSnapshot | null> {
+  let res: Response;
+  try {
+    res = await fetch(`/api/call/${encodeURIComponent(sessionId)}/status`, {
+      headers: { accept: "application/json" },
+      cache: "no-store",
+      signal,
+    });
+  } catch {
+    return null;
+  }
+  if (!res.ok) return null;
+
+  let payload: unknown;
+  try {
+    payload = (await res.json()) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof payload !== "object" || payload === null) return null;
+
+  const record = payload as Record<string, unknown>;
+  if (!isCallProvider(record.provider) || !isCallState(record.state)) return null;
+
+  return {
+    provider: record.provider,
+    state: record.state,
+    callId: typeof record.callId === "string" ? record.callId : null,
+    detail: typeof record.detail === "string" ? record.detail : null,
+  };
+}
+
 /** Turns a failed score card request into one sentence the rep can act on. */
 function describeDebriefFailure(status: number, payload: unknown): string {
   if (typeof payload === "object" && payload !== null) {
@@ -246,15 +429,18 @@ function CallScreen() {
   const [storedPractice, setStoredPractice] = useState<StoredPractice | null>(null);
   const [storedChecked, setStoredChecked] = useState(false);
 
+  const [repNumber, setRepNumber] = useState("");
+
   // localStorage does not exist during the prerender, so the restore cannot be a
   // lazy initial state without the server and the client disagreeing about which
-  // screen to paint. Reading it once after mount is the pattern, and the two
+  // screen to paint. Reading it once after mount is the pattern, and the
   // setState calls are the whole point of the effect.
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setStored(loadSession());
     setStoredPractice(readStoredPractice());
     setStoredChecked(true);
+    setRepNumber(readRepNumber());
   }, []);
 
   const sessionId = fromUrl.length > 0 ? fromUrl : (stored?.sessionId ?? null);
@@ -287,6 +473,7 @@ function CallScreen() {
     sensitivity,
     busy,
     error,
+    call,
     practice,
     startClient,
     startRep,
@@ -297,6 +484,7 @@ function CallScreen() {
     setSensitivity,
     refreshDevices,
     reset,
+    applyCallState,
     startPractice,
     endPractice,
     cutIn,
@@ -562,12 +750,274 @@ function CallScreen() {
     startPractice();
   }, [reset, startPractice]);
 
+  /* ---------------- the phone call ---------------- */
+
+  /* Empty, not the fallback list. lib/calling.ts hands the fallback back inside
+     its error result together with the sentence that says why every option is
+     off, and the fallback drawn on its own would say "this app cannot call"
+     when the truth is "the list has not arrived yet". The launcher has an
+     honest empty state for exactly this, and it asks for the list itself the
+     moment it is opened. */
+  const [providers, setProviders] = useState<CallProviderInfo[]>([]);
+  const [callProvider, setCallProvider] = useState<CallProvider>("manual");
+  const [toNumber, setToNumber] = useState("");
+  const [callBusy, setCallBusy] = useState(false);
+  const [callError, setCallError] = useState<string | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
+  const [callNote, setCallNote] = useState<CallNote | null>(null);
+
+  /**
+   * Read the provider list. Nothing here throws, the result carries the failure.
+   *
+   * The list is never cached, because `ready` is computed from the server
+   * environment: a rep can add TWILIO_ACCOUNT_SID to backend/.env, restart the
+   * server, reopen the popover and see the option come alive.
+   */
+  const loadProviders = useCallback(async (signal?: AbortSignal) => {
+    const result = await fetchProviders(signal);
+    // An aborted request is a screen that has gone away, so it writes nothing.
+    if (signal?.aborted) return;
+    setProviders([...result.providers]);
+    setListError(result.kind === "ok" ? null : withHint(result.message, result.hint));
+  }, []);
+
+  /**
+   * Catch up with a call that was already running before this screen opened.
+   *
+   * The answer is handed to the hook, so it lands on the very same `call` the
+   * socket writes and the chip and the launcher can never disagree. The hook
+   * drops it if a call_state frame has already arrived, so a slow answer cannot
+   * put a stale word back in the bar.
+   */
+  const syncCallState = useCallback(
+    async (signal: AbortSignal) => {
+      if (!sessionId) return;
+      const snapshot = await readCallStatus(sessionId, signal);
+      // A cancelled read belongs to a screen that has gone away.
+      if (snapshot === null || signal.aborted) return;
+      applyCallState(snapshot);
+    },
+    [applyCallState, sessionId],
+  );
+
+  /* One read when the screen opens: which ways there are to call, and whether
+     one is already running. Practice calls skip both: there is nobody to call,
+     so the launcher is not mounted and neither answer would be read.
+
+     The status read is what makes a reload safe. Without it a rep who refreshed
+     during a live call would be shown an empty bar and a Call button, and
+     pressing it would place a second call that Twilio bills for. */
+  useEffect(() => {
+    if (!sessionId || practiceOn) return;
+    const controller = new AbortController();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadProviders(controller.signal);
+    void syncCallState(controller.signal);
+    return () => controller.abort();
+  }, [sessionId, practiceOn, loadProviders, syncCallState]);
+
+  /* The client number the rep already typed on the setup page. Storage does not
+     exist during the prerender, so it is read here rather than as an initial
+     state. It is assigned, never merged: opening a different call must empty the
+     box, because the surest way to dial the wrong person is to leave the last
+     client's number sitting in it. */
+  useEffect(() => {
+    if (!sessionId || practiceOn) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setToNumber(readStoredClientNumber(sessionId));
+  }, [sessionId, practiceOn]);
+
+  const rememberRepNumber = useCallback((value: string) => {
+    setRepNumber(value);
+    writeRepNumber(value);
+  }, []);
+
+  /* A failure belongs to the option that caused it, so it goes when the rep
+     picks another one. Leaving a Twilio message on screen under a WhatsApp
+     choice would read as WhatsApp being broken too. */
+  const pickProvider = useCallback((next: CallProvider) => {
+    setCallProvider(next);
+    setCallError(null);
+  }, []);
+
+  const refreshProviders = useCallback(() => {
+    void loadProviders();
+  }, [loadProviders]);
+
+  const dismissNote = useCallback(() => setCallNote(null), []);
+
+  /**
+   * Place the call.
+   *
+   * Three answers, three different words. A refusal is the backend saying no in
+   * a sentence written for the rep, so it is shown word for word. An error means
+   * the request never landed. A start means the phone is about to ring, or, for
+   * link mode, that WhatsApp is opening in another tab.
+   */
+  const startTheCall = useCallback(() => {
+    if (!sessionId || callBusy) return;
+
+    setCallBusy(true);
+    setCallError(null);
+    setCallNote(null);
+
+    void (async () => {
+      const result = await startCall({
+        sessionId,
+        provider: callProvider,
+        toNumber: toNumber.trim() || null,
+        repNumber: repNumber.trim() || null,
+      });
+
+      if (result.kind === "error") {
+        setCallError(withHint(result.message, result.hint));
+        setCallBusy(false);
+        return;
+      }
+
+      if (result.kind === "refused") {
+        setCallError(result.call.message);
+        setCallBusy(false);
+        return;
+      }
+
+      const url = result.call.openUrl;
+      if (url === null) {
+        /* Twilio is the one provider whose audio the server carries, so it is
+           the one where the rep must NOT go and share a tab as well. Saying so
+           right here is the difference between one clean lane and the same
+           voice arriving twice on it. Every other provider keeps the server's
+           own sentence, which already asks for the shared sound. */
+        const bridged = callProvider === "twilio";
+        setCallNote({
+          text: bridged
+            ? `${result.call.message} The app hears this call from the phone line, so there is no tab to share.`
+            : result.call.message,
+          openUrl: null,
+        });
+        setCallBusy(false);
+        return;
+      }
+
+      /* WhatsApp link mode, the only provider that answers with a link. The tab
+         is opened here so the rep does not have to hunt for it.
+
+         The return value is deliberately not read. window.open answers null
+         whenever noopener is asked for, success or not, so a check on it would
+         report every single open as blocked. noopener is worth keeping: without
+         it the page we just opened gets a handle on this one. So the note covers
+         both outcomes in one line and the link is kept below it, which is the
+         way through when a browser did block the tab. */
+      window.open(url, "_blank", "noopener,noreferrer");
+      setCallNote({
+        /* The server sentence already says to share the tab sound, so this adds
+           only what it cannot know: which button does that, and where the link
+           is if the tab never appeared. */
+        text: `${result.call.message} If the new tab did not open, use the link below. SOURCES here is the button that shares the sound.`,
+        openUrl: url,
+      });
+      setCallBusy(false);
+    })();
+  }, [callBusy, callProvider, repNumber, sessionId, toNumber]);
+
+  /**
+   * End the call.
+   *
+   * Twilio is the only provider the server can really hang up, because it is the
+   * only one holding the call. Every other one lives somewhere the app cannot
+   * reach: the rep's own phone, their own WhatsApp, or Meta's side of a Cloud
+   * API call. For those the server clears the state and this app stops following
+   * the call, and the note says exactly that rather than claiming a phone was
+   * put down when it was not.
+   */
+  const hangUpCall = useCallback(() => {
+    if (!sessionId || callBusy) return;
+
+    const ours = call.provider === "twilio";
+
+    setCallBusy(true);
+    setCallError(null);
+    setCallNote(null);
+
+    void (async () => {
+      const result = await hangUp(sessionId);
+      if (result.kind === "error") {
+        setCallError(withHint(result.message, result.hint));
+      } else {
+        setCallNote({
+          text: ours
+            ? "The call was ended."
+            : "The app stopped following this call. If it is still going, end it where you started it.",
+          openUrl: null,
+        });
+      }
+      setCallBusy(false);
+    })();
+  }, [call.provider, callBusy, sessionId]);
+
   /* ---------------- derived ---------------- */
 
   const socketOpen = connState === "open";
-  const noAudio = !captures.client && !captures.rep;
-  /* No nudge in practice: there is no client audio to plug in, only the mic. */
-  const showNudge = Boolean(sessionId) && socketOpen && noAudio && !nudgeOff && !practiceOn;
+  const browserAudio = captures.client || captures.rep;
+
+  /* A call that is on its way or up, whoever placed it and however. */
+  const callActive =
+    call.state === "dialing" || call.state === "ringing" || call.state === "live";
+
+  /**
+   * The option the launcher draws.
+   *
+   * While a call is up this is the provider that is really on the wire, not the
+   * one this browser happens to have picked. A rep who reloaded the page, or who
+   * opened the call in a second tab, never picked anything here, so the live
+   * panel would otherwise print the wrong sentence about a call that is running:
+   * "Nothing is dialled for you" over a Twilio call that is billing by the
+   * minute. When no call is up it is the rep's own pick, untouched, and that is
+   * the one the start button uses.
+   */
+  const shownProvider = callActive ? call.provider : callProvider;
+
+  /*
+   * A phone call the app placed, on the one provider that forks its sound to us.
+   *
+   * Twilio is that provider, and only Twilio. The other three put the call on
+   * the rep's own phone or their own WhatsApp, where this app cannot hear a
+   * thing, so for those the shared tab stays the only way in and everything
+   * below reads exactly as it did before any of this existed.
+   *
+   * Two values, not one, because the server draws the same line twice and in two
+   * different places, see PHONE_AUDIO_PROVIDERS and PHONE_AUDIO_STATES in
+   * backend/app/api/routes_ws.py:
+   *
+   *   phoneCall  a Twilio call is on its way or up. The browser is never going
+   *              to be the source of this call, so it is never worth sending
+   *              the rep off to share a tab for it.
+   *   phoneAudio the fork is actually running. The server is filling BOTH lanes
+   *              itself and refuses browser frames outright, because a lane is
+   *              shared and not split, and a second source would put the same
+   *              voice into one segmenter twice.
+   *
+   * Ringing sits between them on purpose: nothing is flowing yet, but nothing
+   * ever will flow from this browser either.
+   */
+  const phoneCall = call.provider === "twilio" && callActive;
+  const phoneAudio = call.provider === "twilio" && call.state === "live";
+
+  const noAudio = !browserAudio && !phoneAudio;
+  /* No nudge in practice: there is no client audio to plug in, only the mic.
+     No nudge under a call note either: they hang in the same place, and the note
+     is the more specific of the two, since it already says to open SOURCES.
+     No nudge during a phone call: the server is carrying that sound, or is about
+     to, and "share the call tab" would send the rep to set up a second source
+     the server then throws away frame by frame. */
+  const showNudge =
+    Boolean(sessionId) &&
+    socketOpen &&
+    noAudio &&
+    !phoneCall &&
+    !nudgeOff &&
+    !practiceOn &&
+    callNote === null;
   const sessionGone = status === "error" && SESSION_GONE.test(error ?? "");
   const actions = quickActions.length > 0 ? quickActions : FALLBACK_ACTIONS;
   const shortId = useMemo(
@@ -578,9 +1028,13 @@ function CallScreen() {
     ? captures.rep
       ? "PRESS START, THE CLIENT TALKS FIRST"
       : "PRESS START. THE BROWSER WILL ASK TO USE YOUR MIC, SAY ALLOW"
-    : noAudio
-      ? "OPEN SOURCES ABOVE, OR TYPE A LINE IN THE LOG"
-      : "PRESS 1 TO 8 FOR AN INSTANT LINE";
+    : phoneCall
+      ? phoneAudio
+        ? "THE PHONE CALL FEEDS THE APP, NOTHING TO SHARE"
+        : "PICK UP YOUR PHONE, THEN WE DIAL THE CLIENT"
+      : noAudio
+        ? "OPEN SOURCES ABOVE, OR TYPE A LINE IN THE LOG"
+        : "PRESS 1 TO 8 FOR AN INSTANT LINE";
 
   /* The wave in practice mode.
      client lane: alive for the whole call (there IS a client on the line), with
@@ -598,6 +1052,12 @@ function CallScreen() {
     ? { client: practice.started && !practice.over, rep: captures.rep }
     : captures;
   const waveMuted = practiceOn ? { client: false, rep: muted.rep || clientSpeaking } : muted;
+
+  /* The wave on a real call. It asks "is anything arriving on this lane", not
+     "did this browser plug it in", so a phone call the server is carrying counts
+     as plugged in on both lanes. Every other case is the browser's captures,
+     unchanged. */
+  const liveActive = phoneAudio ? PHONE_LANES : captures;
 
   /* ---------------- no session, or one the server has forgotten ---------------- */
 
@@ -705,6 +1165,44 @@ function CallScreen() {
               {transcript.length}
             </span>
           </button>
+          {/* The call, next to the audio sources, because they are the same job
+              done in two halves: how the voices get on the line, and how they
+              get into this app. The chip draws nothing at all while the call is
+              idle, so a rep who dials with their own phone sees the bar exactly
+              as it was before any of this existed.
+
+              Both are held back below sm, and the reason is width, not taste.
+              Design spec 4.4 gives the 360 px bar exactly four things: the mark,
+              the status pill, LOG and SOURCES. They already fill it. A fifth
+              control there does not wrap, it eats the left group, and the first
+              thing to go under the clip is the status pill, which is the one
+              instrument that has to be readable without a saccade. So the call
+              is placed from a laptop. That is a real cost for exactly one case,
+              a Twilio call started on a phone, where the server hears the line
+              and the browser does not have to, and it is still the better trade
+              than a status pill nobody can read. Every other provider needs a
+              shared tab or a virtual cable anyway, and a phone browser has
+              neither. */}
+          {practiceOn ? null : (
+            <div className="hidden shrink-0 items-center gap-2 sm:flex sm:gap-2.5">
+              <CallStateChip state={call.state} />
+              <CallLauncher
+                providers={providers}
+                value={shownProvider}
+                state={call.state}
+                busy={callBusy}
+                error={callError ?? listError}
+                toNumber={toNumber}
+                repNumber={repNumber}
+                onProvider={pickProvider}
+                onToNumber={setToNumber}
+                onRepNumber={rememberRepNumber}
+                onStart={startTheCall}
+                onHangUp={hangUpCall}
+                onRefresh={refreshProviders}
+              />
+            </div>
+          )}
           <AudioSourcePicker
             devices={devices}
             captures={captures}
@@ -737,6 +1235,18 @@ function CallScreen() {
               Open SOURCES above and share the call tab, or pick a virtual cable. With no hardware at
               all, type what they said in the log and the copilot answers it.
             </p>
+          </div>
+        ) : null}
+
+        {/* The call receipt, hung under the bar in the same place as the hint
+            above. It is not an error, so it is allowed to sit over the top of
+            the glass for the few seconds it takes to read: it only ever appears
+            in the moment after the rep pressed a call button, when the glass is
+            still holding the idle line and not an answer they are reading out
+            loud. On a phone it is moved off the glass entirely, see below. */}
+        {callNote ? (
+          <div className="absolute right-3 top-[calc(100%+6px)] z-40 hidden w-[300px] lg:block">
+            <CallNotePanel note={callNote} onDismiss={dismissNote} />
           </div>
         ) : null}
       </header>
@@ -827,7 +1337,7 @@ function CallScreen() {
             onEnd={endPractice}
           />
         ) : (
-          <WaveVisualizer levels={levels} speaking={speaking} active={captures} muted={muted} />
+          <WaveVisualizer levels={levels} speaking={speaking} active={liveActive} muted={muted} />
         )}
       </div>
 
@@ -895,6 +1405,19 @@ function CallScreen() {
         </>
       ) : null}
 
+      {/* The same receipt on a small tablet, parked above the objection bar
+          instead of under the top bar, because the narrow grid puts the glass
+          directly under the bar and words being read out loud are never covered.
+          It starts at sm, the same width the launcher itself starts at. */}
+      {callNote ? (
+        <div
+          className="fixed inset-x-2 z-40 hidden sm:block lg:hidden"
+          style={{ bottom: "calc(56px + env(safe-area-inset-bottom) + 8px)" }}
+        >
+          <CallNotePanel note={callNote} onDismiss={dismissNote} />
+        </div>
+      ) : null}
+
       {practiceOn && debriefOpen ? (
         <Debrief
           data={debriefData}
@@ -955,6 +1478,54 @@ function FaultLine({ message }: { message: string }) {
     <div role="status" className="shrink-0 border-b border-line bg-surface px-3 py-2.5">
       <p className="font-mono text-micro uppercase text-danger">PROBLEM</p>
       <p className="mt-1.5 font-sans text-body text-muted">{message}</p>
+    </div>
+  );
+}
+
+interface CallNotePanelProps {
+  note: CallNote;
+  onDismiss(): void;
+}
+
+/**
+ * What just happened to the call, in one or two plain sentences.
+ *
+ * This is the only place the successful side of a call action is written down.
+ * The launcher owns failures, because a failure is fixed inside the popover,
+ * and this owns the receipt, because the receipt has to outlive the popover: in
+ * WhatsApp link mode the rep is in another tab by the time it matters, and the
+ * sentence they need on the way back is the one that says to share that tab's
+ * sound.
+ *
+ * It is dismissed by hand rather than on a timer. A line that removes itself
+ * while somebody is halfway through reading it is worse than one more click.
+ */
+function CallNotePanel({ note, onDismiss }: CallNotePanelProps) {
+  return (
+    <div role="status" className="border border-line-strong bg-surface-2 p-3 shadow-pop">
+      <div className="flex items-start justify-between gap-2">
+        <p className="font-mono text-micro uppercase text-muted">THE CALL</p>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Hide this call message"
+          className="-mr-1 -mt-1 flex h-5 w-5 items-center justify-center rounded-hair text-dim transition-colors duration-[120ms] hover:text-muted"
+        >
+          <X className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+      </div>
+      <p className="mt-2 font-sans text-[12px] leading-[18px] text-muted">{note.text}</p>
+      {note.openUrl ? (
+        <a
+          href={note.openUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-2 inline-flex h-[26px] items-center gap-1.5 rounded-hair border border-line-strong px-2 font-mono text-micro uppercase text-accent transition-colors duration-[120ms] hover:bg-surface"
+        >
+          <ExternalLink className="h-3 w-3" aria-hidden="true" />
+          Open WhatsApp
+        </a>
+      ) : null}
     </div>
   );
 }

@@ -170,6 +170,76 @@ wait a minute.
 
 ---
 
+## Placing the call
+
+Until now you dialled with your own phone and the app just listened. It still can, and that
+is still the default and the only free way that needs no setup at all. There are now four
+ways, and the app tells you the cost of each before you press anything.
+
+| Option | Cost | What happens |
+|---|---|---|
+| **I will dial myself** | Free | You call from your phone or WhatsApp. The app only listens. |
+| **WhatsApp, from my phone** | Free | The app opens WhatsApp with the number ready. You press call. |
+| **WhatsApp, from the app** | Meta business rates | The app places the WhatsApp call. Needs a Meta business number. |
+| **Phone call, from the app** | About 1 to 3 US cents a minute, plus the number | We ring your phone first, then join the client. The app hears both sides. |
+
+The first two work right now with nothing to set up. The other two need keys, and the
+picker greys them out and names the exact variables that are missing until you add them.
+
+### Twilio setup
+
+You need a Twilio account, a phone number you rent from them, and a public web address,
+because Twilio has to reach your machine from the internet. On a laptop that means a tunnel:
+
+```bash
+ngrok http 8000            # gives you https://something.ngrok-free.app
+```
+
+Then in `backend/.env`:
+
+```
+TWILIO_ACCOUNT_SID=ACxxxxxxxx
+TWILIO_AUTH_TOKEN=xxxxxxxx
+TWILIO_FROM_NUMBER=+15551234567
+PUBLIC_BASE_URL=https://something.ngrok-free.app
+CALL_WEBHOOK_SECRET=any-long-random-string
+```
+
+When you press "Ring my phone", Twilio calls YOUR phone first, and only joins the client
+after you pick up, so the client never hears dead air. Twilio then forks the live audio to
+the app, which hears both sides of the call: the client on one lane, you on the other.
+
+`CALL_WEBHOOK_SECRET` signs the webhook links so a stranger cannot drive them. Leave it
+empty and a new one is made at every start, which is safe but breaks a call that is already
+ringing when you restart the server.
+
+A Twilio trial account can only call numbers you have verified in their console. That is
+their rule, not ours, and the app passes their error through in plain words.
+
+### WhatsApp setup
+
+The link option needs nothing. The app opens `wa.me` with the number filled in, you press
+call in WhatsApp, and then you share that tab's audio so the app can hear.
+
+Calling from inside the app uses the WhatsApp Business Calling API, which needs a Meta
+Business account, a WhatsApp Business number with calling switched on, and the recipient
+consent rules Meta sets. Add `WHATSAPP_TOKEN` and `WHATSAPP_PHONE_ID` to `backend/.env` to
+switch it on. **This path is written but was never tested here, because there are no Meta
+credentials on this machine.** Everything else in this README was run and verified.
+
+### What was actually verified
+
+A real Twilio call needs a paid account, so instead the phone audio path was tested by
+building exactly what Twilio sends: real speech encoded to 8 kHz G.711 mu-law, wrapped in
+Twilio's own Media Streams frames, pushed at the media socket. Whisper read it back word
+for word, the audio landed on the correct lane, and the copilot answered it. The transcode
+is cross checked against the reference implementation on all 256 mu-law codes.
+
+So the pipeline is proven. Only the credentials are missing.
+
+
+---
+
 ## Latency
 
 Measured on this machine against the Groq free tier, not estimated.
@@ -252,6 +322,12 @@ backend/
   app/services/practice_engine.py the persona and coach model calls, with fallbacks
   app/services/scoring.py        the scorecard arithmetic, pure and self testing
   app/api/routes_practice.py     practice REST
+  app/telephony.py               the four calling options, readiness, number checking
+  app/services/telephony_audio.py mu-law to 16 kHz PCM, self testing
+  app/services/twilio_client.py  places the call, builds the TwiML
+  app/services/whatsapp_client.py the link, and the Cloud API scaffold
+  app/api/routes_call.py         calling REST
+  app/api/routes_twilio.py       Twilio webhooks and the media socket
 frontend/
   app/page.tsx                   setup
   app/call/page.tsx              the cockpit
@@ -275,6 +351,10 @@ body `{ knowledgeBase, clientUrl?, clientContext?, callGoal?, language? }`
 `GET  /api/health`          -> `{ status, groqConfigured, sessions, version, models }`
 `POST /api/practice/start`  same body as prepare-context plus `difficulty`, returns the opening line
 `GET  /api/practice/difficulties`
+`GET  /api/call/providers`  -> the four ways to call, with cost and what is missing
+`POST /api/call/start`      -> places the call, or hands back a WhatsApp link
+`POST /api/call/{id}/hangup`
+`WS   /ws/twilio`           -> Twilio Media Streams, token guarded
 `GET  /api/practice/{id}/debrief` -> the scorecard
 `GET  /api/quick-actions`   -> the 8 frozen objection buttons
 `GET  /api/session/{id}`    -> `{ exists, turns, createdAt }`

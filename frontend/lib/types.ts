@@ -205,6 +205,76 @@ export interface Debrief {
 }
 
 /* ------------------------------------------------------------------ */
+/* Calling                                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The four ways a call can be placed.
+ *
+ * Frozen list, from CONTRACT_CALLING.md section 2.1. It is the same four words
+ * as `CALL_PROVIDERS` in backend/app/models.py and `CallProvider` in
+ * backend/app/services/session_store.py, so all three have to move together.
+ */
+export type CallProvider = "manual" | "whatsapp_link" | "whatsapp_cloud" | "twilio";
+
+/**
+ * Every state a phone call is allowed to be in.
+ *
+ * Carriers speak their own words for this. Twilio alone sends queued, initiated,
+ * ringing, in-progress, completed, busy, no-answer, canceled and failed. The
+ * backend maps all of them onto these six before anything reaches the browser,
+ * so the UI only ever has six cases to draw.
+ */
+export type CallState = "idle" | "dialing" | "ringing" | "live" | "ended" | "failed";
+
+/**
+ * One row in the provider picker, from GET /api/call/providers.
+ *
+ * `cost` and `missing` are the honest part and are never hidden. A provider with
+ * `ready: false` must be drawn disabled, and must still show what it costs and
+ * which environment variables are missing, so the rep can see the option exists
+ * and what it would take to turn it on. A rep must never find out that a call
+ * costs money by being charged for one.
+ */
+export interface CallProviderInfo {
+  key: CallProvider;
+  /** Short name of the option, for example "Ring my phone". */
+  label: string;
+  /** One plain line saying what happens when this option is picked. */
+  blurb: string;
+  /** What it costs in plain words, for example "Free". Never empty. */
+  cost: string;
+  /** True only when this provider can place a call right now. */
+  ready: boolean;
+  /**
+   * Names of the environment variables still needed, empty when ready. Shown to
+   * the rep word for word, so they know exactly what to add to backend/.env.
+   */
+  missing: string[];
+}
+
+/**
+ * The body of POST /api/call/start, on the 200 and on the 400 alike.
+ *
+ * The backend answers with this same shape either way, with `ok: false` and a
+ * `message` that says what went wrong in plain words, so the UI shows `message`
+ * without ever having to guess from a status code.
+ */
+export interface CallStartResult {
+  ok: boolean;
+  provider: CallProvider;
+  /** The provider's own id for this call, for example a Twilio call sid. */
+  callId: string | null;
+  /**
+   * A link the browser must open. WhatsApp link mode only, null for every other
+   * provider.
+   */
+  openUrl: string | null;
+  /** One plain line for the rep. Never empty. */
+  message: string;
+}
+
+/* ------------------------------------------------------------------ */
 /* Wire frames                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -238,7 +308,19 @@ export type ServerMessage =
       ms: number;
     }
   | { type: "practice_over"; reason: PracticeOverReason; turns: number; message: string }
-  | { type: "practice_state"; turns: number; started: boolean };
+  | { type: "practice_state"; turns: number; started: boolean }
+  /**
+   * Pushed whenever the phone call changes state, so the call page shows the
+   * ringing and connected states without polling. The backend builds it from
+   * `Session.call_snapshot()`, which always fills all four fields.
+   */
+  | {
+      type: "call_state";
+      provider: CallProvider;
+      state: CallState;
+      callId: string | null;
+      detail: string | null;
+    };
 
 /** Client to server TEXT frames. Audio goes over BINARY frames instead. */
 export type ClientMessage =
@@ -274,6 +356,18 @@ function isNum(v: unknown): v is number {
 
 function isBool(v: unknown): v is boolean {
   return typeof v === "boolean";
+}
+
+/**
+ * A string, or an explicit null.
+ *
+ * The call frames carry two fields that are genuinely empty a lot of the time,
+ * so null is a real value there and not a missing field. `undefined` is refused
+ * on purpose: a field the server forgot is a bug, and it should show up as a
+ * rejected frame rather than as the word "undefined" on the glass.
+ */
+function isStrOrNull(v: unknown): v is string | null {
+  return v === null || typeof v === "string";
 }
 
 function isQuickAction(v: unknown): v is QuickAction {
@@ -391,6 +485,31 @@ export function isDifficulty(v: unknown): v is Difficulty {
 }
 
 /**
+ * True when `v` is one of the four frozen provider keys.
+ *
+ * Exported because the provider picker reads the same list back out of the
+ * providers endpoint and out of localStorage, and a key we do not know must be
+ * dropped rather than drawn as a button that cannot place a call.
+ */
+export function isCallProvider(v: unknown): v is CallProvider {
+  return (
+    v === "manual" || v === "whatsapp_link" || v === "whatsapp_cloud" || v === "twilio"
+  );
+}
+
+/** True when `v` is one of the six frozen call states. */
+export function isCallState(v: unknown): v is CallState {
+  return (
+    v === "idle" ||
+    v === "dialing" ||
+    v === "ringing" ||
+    v === "live" ||
+    v === "ended" ||
+    v === "failed"
+  );
+}
+
+/**
  * True when a stored session was prepared for practice.
  *
  * A live session has no `mode` field at all, so this is the one safe way to tell
@@ -422,6 +541,12 @@ export function isPracticeSession(
  * The practice frames are checked just as tightly. `mood`, `intent` and
  * `objection` must already be one of the frozen persona values, so the server is
  * the one that has to clean up a sloppy model reply, not the browser.
+ *
+ * The `call_state` frame is checked the same way. `provider` and `state` must
+ * already be one of the frozen words, because the carrier's own vocabulary is
+ * mapped to ours on the server, and `callId` and `detail` must be a string or an
+ * explicit null. All four fields are required, which is what
+ * `Session.call_snapshot()` sends.
  */
 export function isServerMessage(v: unknown): v is ServerMessage {
   if (!isRecord(v) || !isStr(v.type)) return false;
@@ -483,6 +608,13 @@ export function isServerMessage(v: unknown): v is ServerMessage {
       return isPracticeOverReason(v.reason) && isNum(v.turns) && isStr(v.message);
     case "practice_state":
       return isNum(v.turns) && isBool(v.started);
+    case "call_state":
+      return (
+        isCallProvider(v.provider) &&
+        isCallState(v.state) &&
+        isStrOrNull(v.callId) &&
+        isStrOrNull(v.detail)
+      );
     default:
       return false;
   }

@@ -24,9 +24,27 @@
  *   startPractice  () => void           the same three actions, also at the top
  *   endPractice    () => void           level, so a call site can destructure
  *   cutIn          () => void           either way
+ *   call           CallSnapshot         the phone call, from the call_state frame
+ *   applyCallState (CallSnapshot) => void   seed that from a status read
  *
  * Nothing in 4.4 was renamed or removed, so any component written against the
  * contract keeps working.
+ *
+ * CALLING (CONTRACT_CALLING.md section 2.3)
+ *
+ * The server pushes one extra frame, `call_state`, whenever the phone call
+ * changes: the provider, the state (idle, dialing, ringing, live, ended,
+ * failed), the provider's own call id and one plain line of detail. It lands on
+ * `call` and on nothing else. A ringing phone is not copilot work, so it never
+ * moves the status pill, never touches the glass, and never clears an answer the
+ * rep may still be reading. A session that never places a call stays on the idle
+ * snapshot for its whole life, so the live path is exactly what it was before.
+ *
+ * That frame is pushed only when the call MOVES, so a browser that opens in the
+ * middle of a call that is already running would hear nothing until it ends. The
+ * page covers that gap by reading GET /api/call/{id}/status once when it opens
+ * and handing the answer to `applyCallState`. A pushed frame always beats that
+ * read, so a reload can restore the call state but can never rewrite it.
  *
  * PRACTICE MODE (CONTRACT_PRACTICE.md sections 3 and 6.1)
  *
@@ -70,6 +88,8 @@ import { teleprompterWsUrl } from "@/lib/config";
 import { cancelSpeech, primeSpeech, rateForDifficulty, speak } from "@/lib/practice/speech";
 import { TeleprompterSocket } from "@/lib/ws/client";
 import type {
+  CallProvider,
+  CallState,
   CallStatus,
   ConnState,
   Difficulty,
@@ -99,6 +119,24 @@ export interface LatencySnapshot {
   firstToken: number | null;
   total: number | null;
   rtt: number | null;
+}
+
+/**
+ * Where the phone call is right now.
+ *
+ * These are the four fields of the `call_state` frame, unchanged. The call page
+ * shows `state` as a chip in the top bar and `detail` as the reason when the
+ * state is failed, so both are kept exactly as the server sent them.
+ */
+export interface CallSnapshot {
+  /** Which way the call was placed, or the default before one is placed. */
+  provider: CallProvider;
+  /** idle, dialing, ringing, live, ended or failed. */
+  state: CallState;
+  /** The provider's own id for the call, for example a Twilio call sid. */
+  callId: string | null;
+  /** One plain line about the state, normally only set on failed. */
+  detail: string | null;
 }
 
 /**
@@ -166,6 +204,7 @@ export interface TeleprompterApi {
   sensitivity: number;
   busy: StreamKind | null;
   error: string | null;
+  call: CallSnapshot;
   practice: PracticeApi;
   startClient(source: ClientSource): Promise<void>;
   startRep(deviceId?: string): Promise<void>;
@@ -176,6 +215,19 @@ export interface TeleprompterApi {
   setSensitivity(v: number): void;
   refreshDevices(): void;
   reset(): void;
+  /**
+   * Write the call state that a one off status read just brought back.
+   *
+   * The server pushes a `call_state` frame only when the call MOVES, so a
+   * browser that opened in the middle of a call that is already running is told
+   * nothing at all until it ends. That browser reads the state once from
+   * GET /api/call/{id}/status and hands the answer here, which is what brings
+   * the chip and the launcher back after a reload.
+   *
+   * A frame the socket already pushed always wins over this, so an answer that
+   * was slow to arrive can never put a stale word back on the bar.
+   */
+  applyCallState(snapshot: CallSnapshot): void;
   /**
    * The three practice actions are the same function objects that sit on
    * `practice`. They are here as well so a component can take them straight off
@@ -203,6 +255,19 @@ const PRACTICE_TICK_MS = 500;
 
 /** The level used when the caller did not name one. */
 const DEFAULT_DIFFICULTY: Difficulty = "normal";
+
+/**
+ * The call snapshot for a session that has not placed a call.
+ *
+ * Same values the backend starts a session with, so the chip in the top bar says
+ * the same thing whether it is reading this constant or a frame from the server.
+ */
+const IDLE_CALL: CallSnapshot = {
+  provider: "manual",
+  state: "idle",
+  callId: null,
+  detail: null,
+};
 
 const MIN_SENSITIVITY = 0.5;
 const MAX_SENSITIVITY = 3;
@@ -300,6 +365,7 @@ export function useTeleprompter(
   const [sensitivity, setSensitivityValue] = useState<number>(1);
   const [busy, setBusy] = useState<StreamKind | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [call, setCall] = useState<CallSnapshot>(IDLE_CALL);
 
   /* ---------------- practice mode state ---------------- */
 
@@ -355,6 +421,17 @@ export function useTeleprompter(
   const busyRef = useRef<StreamKind | null>(null);
   const sensitivityRef = useRef<number>(1);
   const capturesRef = useRef<StreamFlags>({ client: false, rep: false });
+
+  /**
+   * True once the server has pushed a `call_state` frame for this session.
+   *
+   * The status read the page does on open is a photograph of a moment that has
+   * already passed by the time it lands. A frame is live. So the frame wins:
+   * once one has arrived, `applyCallState` stops writing. It is a ref because
+   * nothing on screen depends on it, and it is cleared by the teardown below,
+   * because a new session id is a new call.
+   */
+  const callPushedRef = useRef<boolean>(false);
 
   /**
    * The half duplex gate. True means the browser is talking, so nothing the
@@ -735,6 +812,25 @@ export function useTeleprompter(
           break;
         }
 
+        case "call_state": {
+          // The phone call moved. This frame is the only one that says nothing
+          // at all about the copilot, so it writes one piece of state and
+          // touches nothing else: a phone that starts ringing must not move the
+          // status pill, and it must never take a line off the glass while the
+          // rep is still reading it out loud.
+          //
+          // From here on the socket is the only thing allowed to write the call.
+          // A status read that is still in flight is already out of date.
+          callPushedRef.current = true;
+          setCall({
+            provider: msg.provider,
+            state: msg.state,
+            callId: msg.callId ?? null,
+            detail: msg.detail ?? null,
+          });
+          break;
+        }
+
         case "practice_state": {
           setPracticeTurns(msg.turns);
           if (msg.started) {
@@ -854,6 +950,13 @@ export function useTeleprompter(
       setSpeaking({ client: false, rep: false });
       setStreaming(false);
       setClientSpeaking(false);
+
+      // A new session id is a new phone call as well. Carrying the old one over
+      // would leave a LIVE chip in the bar for a call that belongs to a session
+      // this hook is no longer connected to. The gate goes with it, so the next
+      // session's status read is allowed to write once more.
+      setCall(IDLE_CALL);
+      callPushedRef.current = false;
 
       // A new session id is a new rehearsal. Without this, the "Practise again"
       // button would land on a page that still says the last call is over and
@@ -1204,6 +1307,19 @@ export function useTeleprompter(
     socketRef.current?.send({ type: "control", action: "reset", stream: "all" });
   }, [cancelTextFrame]);
 
+  /**
+   * Take the call state from the page's own status read.
+   *
+   * This is the only door into `call` that is not the socket, and it is a narrow
+   * one on purpose: it writes nothing once a `call_state` frame has landed, and
+   * it touches no other piece of state, so a phone call being found in progress
+   * cannot move the status pill or the glass any more than a pushed frame can.
+   */
+  const applyCallState = useCallback((snapshot: CallSnapshot) => {
+    if (callPushedRef.current) return;
+    setCall(snapshot);
+  }, []);
+
   /* ---------------------------------------------------------------- */
   /* practice actions                                                  */
   /* ---------------------------------------------------------------- */
@@ -1342,6 +1458,7 @@ export function useTeleprompter(
       sensitivity,
       busy,
       error,
+      call,
       practice,
       startClient,
       startRep,
@@ -1352,6 +1469,7 @@ export function useTeleprompter(
       setSensitivity,
       refreshDevices,
       reset,
+      applyCallState,
       startPractice,
       endPractice,
       cutIn,
@@ -1375,6 +1493,7 @@ export function useTeleprompter(
       sensitivity,
       busy,
       error,
+      call,
       practice,
       startClient,
       startRep,
@@ -1385,6 +1504,7 @@ export function useTeleprompter(
       setSensitivity,
       refreshDevices,
       reset,
+      applyCallState,
       startPractice,
       endPractice,
       cutIn,

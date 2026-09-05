@@ -45,6 +45,35 @@ PRACTICE_OUTCOMES: frozenset[str] = frozenset({"booked", "soft_yes", "no_answer"
 DEFAULT_OUTCOME: str = "no_answer"
 """Outcome used when the coach model answers with a word we do not know."""
 
+CALL_PROVIDERS: frozenset[str] = frozenset(
+    {"manual", "whatsapp_link", "whatsapp_cloud", "twilio"}
+)
+"""The four ways a call can be placed.
+
+Keep this in step with ``app.telephony.PROVIDERS``, which owns the labels, the
+blurbs and the cost lines, and with ``session_store.CallProvider``, which is the
+same four words as a typing Literal.
+"""
+
+DEFAULT_CALL_PROVIDER: str = "manual"
+"""Provider used before the rep picks one. The rep dials, the app only listens."""
+
+CALL_STATES: frozenset[str] = frozenset(
+    {"idle", "dialing", "ringing", "live", "ended", "failed"}
+)
+"""Every state a phone call is allowed to be in, mirrored by ``session_store.CallState``."""
+
+DEFAULT_CALL_STATE: str = "idle"
+"""State of a session that has never started a call."""
+
+MAX_PHONE_CHARS: int = 32
+"""Longest phone number string we keep. A real E.164 number is at most 16 characters.
+
+The extra room is for the spaces, dashes and brackets people type. Cleaning the
+number into real E.164 is ``app.telephony.normalise_e164``, not this module, so
+there is exactly one place that decides what a good number looks like.
+"""
+
 
 class CamelModel(BaseModel):
     """Base model that speaks camelCase on the wire and snake_case in Python.
@@ -568,6 +597,218 @@ class DebriefResponse(CamelModel):
         return key if key in PRACTICE_OUTCOMES else DEFAULT_OUTCOME
 
 
+class CallProviderModel(CamelModel):
+    """One way of placing the call, as shown in the provider picker.
+
+    The picker is the one place the rep learns that a call costs money, so
+    ``cost`` is never empty and ``missing`` is never hidden. A provider with
+    ``ready=False`` must be drawn disabled and must show both of them.
+
+    Attributes:
+        key: Stable identifier, one of :data:`CALL_PROVIDERS`.
+        label: Short name of the option, for example ``"Ring my phone"``.
+        blurb: One plain line saying what happens when the rep picks this.
+        cost: What it costs in plain words, for example ``"Free"``. Never empty.
+        ready: Whether this provider can actually place a call right now, which
+            is computed from the environment by ``app.telephony``.
+        missing: Names of the environment variables still needed, empty when the
+            provider is ready. Shown to the rep word for word, so they know
+            exactly what to add to ``backend/.env``.
+    """
+
+    key: str
+    label: str
+    blurb: str
+    cost: str
+    ready: bool = False
+    missing: list[str] = Field(default_factory=list)
+
+
+class CallProvidersResponse(CamelModel):
+    """Result of ``GET /api/call/providers``.
+
+    Attributes:
+        providers: The four providers, in display order, cheapest and simplest
+            first. Providers that are not configured are still listed, because
+            the rep needs to see that the option exists and what it needs.
+    """
+
+    providers: list[CallProviderModel] = Field(default_factory=list)
+
+    @classmethod
+    def from_entries(cls, entries: list[dict[str, object]]) -> CallProvidersResponse:
+        """Build the response straight from ``app.telephony.provider_status()``.
+
+        Values are read defensively so a new key in the telephony table can
+        never break this endpoint, which is the one endpoint the call page needs
+        before it can render anything at all.
+
+        Args:
+            entries: Dicts carrying ``key``, ``label``, ``blurb``, ``cost``,
+                ``ready`` and ``missing``.
+
+        Returns:
+            A populated ``CallProvidersResponse``.
+        """
+        providers: list[CallProviderModel] = []
+        for entry in entries:
+            raw_missing = entry.get("missing") or []
+            missing = [str(name) for name in raw_missing] if isinstance(raw_missing, list) else []
+            providers.append(
+                CallProviderModel(
+                    key=str(entry.get("key", "")),
+                    label=str(entry.get("label", "")),
+                    blurb=str(entry.get("blurb", "")),
+                    cost=str(entry.get("cost", "")),
+                    ready=bool(entry.get("ready", False)),
+                    missing=missing,
+                )
+            )
+        return cls(providers=providers)
+
+
+class CallStartRequest(CamelModel):
+    """Body of ``POST /api/call/start``.
+
+    Numbers are only stripped and capped here. Turning them into real E.164 is
+    ``app.telephony.normalise_e164``, so the route can answer a bad number with
+    the plain 400 body the contract asks for instead of a pydantic error blob.
+
+    Attributes:
+        session_id: The session this call belongs to. The call state is stored
+            on that session, so an unknown id is a 404 at the route.
+        provider: One of :data:`CALL_PROVIDERS`. Required, and never guessed.
+        to_number: The client's number. Required for every provider except
+            ``manual``, which the route checks because the message it has to
+            send back is provider specific.
+        rep_number: The rep's own phone, which Twilio rings first. Only used by
+            the ``twilio`` provider.
+    """
+
+    session_id: str = Field(min_length=1, max_length=64)
+    provider: str
+    to_number: str | None = None
+    rep_number: str | None = None
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _check_provider(cls, value: object) -> str:
+        """Lowercase the provider and refuse a word we do not know.
+
+        This is the one place in the file that raises instead of falling back to
+        a default. Language, difficulty and outcome all fall back because a
+        wrong value there costs nothing. Here it would cost the rep a call: a
+        silent fall back to ``manual`` would answer "you dial it yourself" to
+        someone who asked us to ring their phone, and they would sit and wait
+        for a ring that never comes.
+
+        Args:
+            value: Raw incoming provider value of any type.
+
+        Returns:
+            One of :data:`CALL_PROVIDERS`.
+
+        Raises:
+            ValueError: When the provider is missing or unknown.
+        """
+        key = value.strip().lower() if isinstance(value, str) else ""
+        if key not in CALL_PROVIDERS:
+            raise ValueError(
+                "Pick how to call: manual, whatsapp_link, whatsapp_cloud or twilio."
+            )
+        return key
+
+    @field_validator("to_number", "rep_number", mode="before")
+    @classmethod
+    def _clean_number(cls, value: object) -> object:
+        """Strip a phone number, cap it, and turn an empty result into ``None``.
+
+        Args:
+            value: Raw incoming value, usually a string or ``None``.
+
+        Returns:
+            ``None`` for empty input, the stripped and capped string otherwise,
+            or the untouched value when it is not a string so pydantic can
+            report the real type error.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        return cleaned[:MAX_PHONE_CHARS]
+
+
+class CallStartResponse(CamelModel):
+    """Result of ``POST /api/call/start``, on both the 200 and the 400.
+
+    The same shape is returned when the call could not start, with ``ok=False``
+    and a ``message`` that says what is missing in plain words. The frontend
+    shows ``message`` either way, so it never has to guess from a status code.
+
+    Attributes:
+        ok: Whether the call was actually placed or the link was actually built.
+        provider: The provider that was used, echoed back.
+        call_id: The provider's own id for this call, for example a Twilio call
+            sid. ``None`` for link mode and for manual.
+        open_url: A link the browser must open, used by WhatsApp link mode only.
+            ``None`` for every other provider.
+        message: One plain line for the rep, for example "Your phone is ringing
+            now. Pick it up and we will dial the client." Never empty.
+    """
+
+    ok: bool = False
+    provider: str = DEFAULT_CALL_PROVIDER
+    call_id: str | None = None
+    open_url: str | None = None
+    message: str = ""
+
+
+class CallStatusResponse(CamelModel):
+    """Result of ``GET /api/call/{session_id}/status``.
+
+    The same four fields are pushed down the teleprompter socket as a
+    ``call_state`` frame, so the call page can show the state without polling.
+    ``Session.call_snapshot()`` builds that frame from the very same fields.
+
+    Attributes:
+        provider: The provider this session last used.
+        state: One of :data:`CALL_STATES`.
+        call_id: The provider's own id for the call, or ``None``.
+        detail: One plain line with more about the state, for example why it
+            failed. ``None`` when there is nothing to add.
+    """
+
+    provider: str = DEFAULT_CALL_PROVIDER
+    state: str = DEFAULT_CALL_STATE
+    call_id: str | None = None
+    detail: str | None = None
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _normalize_state(cls, value: object) -> str:
+        """Lowercase the state and fall back to ``idle`` when unknown.
+
+        Providers speak their own words for this. Twilio alone sends queued,
+        initiated, ringing, in-progress, completed, busy, no-answer, canceled
+        and failed. Mapping those onto our six is the job of the Twilio routes,
+        and this validator is only the last guard so a word nobody mapped can
+        never turn a status poll into a 500 in the middle of a live call.
+
+        Args:
+            value: Raw state value of any type.
+
+        Returns:
+            One of :data:`CALL_STATES`.
+        """
+        if not isinstance(value, str):
+            return DEFAULT_CALL_STATE
+        key = value.strip().lower()
+        return key if key in CALL_STATES else DEFAULT_CALL_STATE
+
+
 __all__ = [
     "SUPPORTED_LANGUAGES",
     "DEFAULT_LANGUAGE",
@@ -578,6 +819,11 @@ __all__ = [
     "DEFAULT_DIFFICULTY",
     "PRACTICE_OUTCOMES",
     "DEFAULT_OUTCOME",
+    "CALL_PROVIDERS",
+    "DEFAULT_CALL_PROVIDER",
+    "CALL_STATES",
+    "DEFAULT_CALL_STATE",
+    "MAX_PHONE_CHARS",
     "CamelModel",
     "PrepareContextRequest",
     "PrepareContextResponse",
@@ -595,4 +841,9 @@ __all__ = [
     "BreakdownModel",
     "FixModel",
     "DebriefResponse",
+    "CallProviderModel",
+    "CallProvidersResponse",
+    "CallStartRequest",
+    "CallStartResponse",
+    "CallStatusResponse",
 ]

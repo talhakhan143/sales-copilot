@@ -348,6 +348,23 @@ function isPrepareResponse(value: unknown): value is PrepareResponse {
   return typeof v.sessionId === "string" && typeof v.systemPrompt === "string";
 }
 
+/**
+ * What actually goes into localStorage.
+ *
+ * One field more than a prepared session: the client's phone number, so the call
+ * page can fill the number in for the rep instead of asking for it a second
+ * time. It is never sent to the backend from here, because building the call
+ * notes has nothing to do with dialling.
+ *
+ * lib/session.ts normalises a stored record down to PreparedSession and drops
+ * every field it does not know, so the call page reads this one out of the
+ * stored JSON itself, exactly the way it already reads the practice flag.
+ */
+type StoredSession = (PreparedSession | PracticeSession) & {
+  /** The client's number as the rep typed it, or null when the box was empty. */
+  clientPhone: string | null;
+};
+
 /** Turns any non 200 payload into one sentence a human can act on. */
 function describeFailure(status: number, payload: unknown): string {
   if (typeof payload === "object" && payload !== null) {
@@ -420,6 +437,7 @@ export function SetupForm() {
   const [knowledgeBase, setKnowledgeBase] = useState("");
   const [urlRaw, setUrlRaw] = useState("");
   const [clientNotes, setClientNotes] = useState("");
+  const [clientPhone, setClientPhone] = useState("");
   const [goal, setGoal] = useState("");
   const [language, setLanguage] = useState(LANGUAGES[0]?.code ?? "en");
 
@@ -574,13 +592,34 @@ export function SetupForm() {
       };
     }
 
-    /* The whole object is written, practice fields included, so the call page can
-       tell a rehearsal from a real call after a refresh. */
-    saveSession(session);
+    /* The whole object is written, practice fields and the client number
+       included, so the call page can tell a rehearsal from a real call after a
+       refresh and can fill in the number the rep already typed.
+
+       A practice call stores no number. Its box is not on screen, so a number
+       still sitting in the state is one the rep typed for a live call and then
+       switched away from, and writing somebody's real phone number into storage
+       under a rehearsal that will never dial it is not ours to do. */
+    const stored: StoredSession = {
+      ...session,
+      clientPhone: practice ? null : clientPhone.trim() || null,
+    };
+    saveSession(stored);
     setResult(session);
     setResume(null);
     setPhase("ready");
-  }, [blocked, busy, clientNotes, difficulty, goal, knowledgeBase, language, practice, urlState]);
+  }, [
+    blocked,
+    busy,
+    clientNotes,
+    clientPhone,
+    difficulty,
+    goal,
+    knowledgeBase,
+    language,
+    practice,
+    urlState,
+  ]);
 
   const onSubmit = useCallback(
     (event: React.FormEvent<HTMLFormElement>) => {
@@ -882,6 +921,46 @@ export function SetupForm() {
               className={`${FIELD_INPUT} min-h-[104px] resize-y py-2.5 leading-[1.55]`}
             />
           </div>
+
+          {/* The number is kept on this browser only. It is not sent with the
+              notes, because building the notes has nothing to do with dialling.
+              The call page picks it up from the saved call and fills it in.
+
+              A practice call has nobody to ring. The robot client lives in this
+              browser, the call page mounts no call button at all for it, and it
+              never reads this number. So the box is not shown, because a box
+              that asks for a real client's phone number and then does nothing
+              with it is a promise the app cannot keep. */}
+          {practice ? null : (
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="client-phone" className={FIELD_LABEL}>
+                Client phone number
+              </label>
+              <p id="client-phone-desc" className={FIELD_DESC}>
+                Only fill this in if you want the app to call the client for you. Write the country
+                code too, like +92.
+              </p>
+              <div className="relative">
+                <Phone className={FIELD_ICON} aria-hidden="true" />
+                <input
+                  id="client-phone"
+                  name="clientPhone"
+                  type="text"
+                  inputMode="tel"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={clientPhone}
+                  aria-describedby="client-phone-desc"
+                  onChange={(e) => {
+                    setClientPhone(e.target.value);
+                    invalidate();
+                  }}
+                  placeholder="+92 300 1234567"
+                  className={FIELD_INPUT}
+                />
+              </div>
+            </div>
+          )}
 
           <div className="flex flex-col gap-1.5">
             <label htmlFor="goal" className={FIELD_LABEL}>

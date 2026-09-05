@@ -43,6 +43,22 @@ TurnRole = Literal["client", "rep", "copilot"]
 SessionMode = Literal["live", "practice"]
 """Whether this session is a real cold call or a rehearsal against the AI client."""
 
+CallProvider = Literal["manual", "whatsapp_link", "whatsapp_cloud", "twilio"]
+"""How the call is being placed.
+
+``manual`` is the old behaviour and stays the default: the rep dials with their
+own phone and the app only listens. The other three are the same four keys as
+``app.models.CALL_PROVIDERS``, and ``app.telephony`` owns their labels and costs.
+"""
+
+CallState = Literal["idle", "dialing", "ringing", "live", "ended", "failed"]
+"""Where the phone call is right now, mirrored by ``app.models.CALL_STATES``.
+
+A provider that speaks its own words, and Twilio does, must map them onto these
+six before they get here. Type that mapping as ``dict[str, CallState]`` and the
+type checker will keep it honest for you.
+"""
+
 MAX_TURNS: int = 200
 """Hard cap on retained turns per session.
 
@@ -153,6 +169,19 @@ class Session:
             ``MAX_PRACTICE_TURNS``. This is what the scorer counts over.
         last_suggestion: The teleprompter line that is on screen right now, kept
             so the next rep turn can be compared against it.
+        call_provider: How this call is being placed. ``manual`` means the rep
+            dials themselves and the app only listens, which is what every
+            session did before calling existed, so it stays the default.
+        call_id: The provider's own id for the call, for example a Twilio call
+            sid, or ``None`` when no call has been placed from the app.
+        call_state: Where the call is right now. ``idle`` until the rep starts
+            one, which is also the only state a manual call ever has.
+        call_detail: One plain line with more about the state, usually why it
+            failed, or ``None`` when there is nothing to add.
+        to_number: The client's number in E.164, or ``None``. Already cleaned by
+            ``app.telephony.normalise_e164`` before it is stored here.
+        rep_number: The rep's own phone in E.164, which Twilio rings first, or
+            ``None``.
     """
 
     id: str
@@ -174,6 +203,12 @@ class Session:
     ended_reason: str | None = None
     practice_turns: list[PracticeTurn] = field(default_factory=list)
     last_suggestion: str = ""
+    call_provider: CallProvider = "manual"
+    call_id: str | None = None
+    call_state: CallState = "idle"
+    call_detail: str | None = None
+    to_number: str | None = None
+    rep_number: str | None = None
 
     def touch(self) -> None:
         """Mark the session as active so the TTL sweeper leaves it alone."""
@@ -196,6 +231,46 @@ class Session:
         now = time.time()
         self.turns.append(Turn(role=role, text=cleaned, ts=now))
         self.last_seen = now
+
+    def set_call_state(
+        self,
+        state: CallState,
+        *,
+        call_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Move the phone call to a new state and refresh ``last_seen``.
+
+        The three fields move together on purpose. A status callback that only
+        knows the new word must not wipe the call id we already have, and a rep
+        watching the screen must not read last call's error line under this
+        call's state.
+
+        So the rule for both keyword arguments is: pass ``None`` to keep what is
+        already stored, and pass an empty string to clear it back to ``None``.
+        Starting a fresh call is therefore
+        ``set_call_state("dialing", call_id=sid, detail="")``, which sets the new
+        id and drops any stale error line in one go.
+
+        Touching the session matters here as much as the state does. A phone call
+        can ring for thirty seconds without a single audio frame arriving, and
+        the TTL sweeper only looks at ``last_seen``.
+
+        Args:
+            state: The new state, one of the six in :data:`CallState`. A provider
+                word like Twilio's ``in-progress`` must be mapped before it is
+                passed in.
+            call_id: The provider's own call id, ``""`` to clear it, or ``None``
+                to leave it alone.
+            detail: One plain line about the state, ``""`` to clear it, or
+                ``None`` to leave it alone.
+        """
+        self.call_state = state
+        if call_id is not None:
+            self.call_id = call_id or None
+        if detail is not None:
+            self.call_detail = detail or None
+        self.last_seen = time.time()
 
     def record_practice_turn(self, turn: PracticeTurn) -> None:
         """Store one practice turn for the scorer.
@@ -330,6 +405,25 @@ class Session:
             hint = hint[:MAX_HINT_CHARS].rstrip().rstrip(",")
         return hint
 
+    def call_snapshot(self) -> dict[str, object]:
+        """Return the call state as the four camelCase fields the wire uses.
+
+        This one dict feeds two places: the body of
+        ``GET /api/call/{id}/status`` and the ``call_state`` frame pushed down
+        the teleprompter socket. Building both from here is what keeps the
+        polled answer and the pushed answer from ever disagreeing.
+
+        Returns:
+            A dict with ``provider``, ``state``, ``callId`` and ``detail``,
+            shaped for ``app.models.CallStatusResponse``.
+        """
+        return {
+            "provider": self.call_provider,
+            "state": self.call_state,
+            "callId": self.call_id,
+            "detail": self.call_detail,
+        }
+
     def snapshot(self) -> dict[str, object]:
         """Return a small JSON safe view of the session.
 
@@ -406,11 +500,17 @@ class SessionStore:
         client_block: str = "",
         knowledge_hint: str = "",
         call_goal: str = "",
+        call_provider: CallProvider = "manual",
+        call_id: str | None = None,
+        call_state: CallState = "idle",
+        call_detail: str | None = None,
+        to_number: str | None = None,
+        rep_number: str | None = None,
     ) -> Session:
         """Create and register a new session.
 
-        Every practice argument is optional and defaulted, so the live call path
-        calls this exactly as it always did.
+        Every practice argument and every calling argument is optional and
+        defaulted, so the live call path calls this exactly as it always did.
 
         Args:
             system_prompt: The fully fused system prompt for the call.
@@ -423,6 +523,16 @@ class SessionStore:
             client_block: Raw client facts for the persona prompt.
             knowledge_hint: Short summary of what the rep sells.
             call_goal: The one line goal for this call.
+            call_provider: How the call will be placed. The default ``manual``
+                is the rep dialling on their own phone, which is what every
+                session did before calling existed.
+            call_id: The provider's own call id, when one is already known.
+            call_state: Where the call is. A brand new session is ``idle``, and
+                a caller almost never has a reason to pass anything else.
+            call_detail: One plain line about the call state.
+            to_number: The client's number in E.164, when the rep already typed
+                it on the setup form.
+            rep_number: The rep's own phone in E.164, for Twilio.
 
         Returns:
             The newly created session, already stored.
@@ -443,6 +553,12 @@ class SessionStore:
             client_block=client_block,
             knowledge_hint=knowledge_hint,
             call_goal=call_goal,
+            call_provider=call_provider,
+            call_id=call_id,
+            call_state=call_state,
+            call_detail=call_detail,
+            to_number=to_number,
+            rep_number=rep_number,
         )
         self._sessions[session.id] = session
         self._created_total += 1
