@@ -577,7 +577,7 @@ function CallScreen() {
   const idleHint = practiceOn
     ? captures.rep
       ? "PRESS START, THE CLIENT TALKS FIRST"
-      : "TURN YOUR MICROPHONE ON, THEN PRESS START"
+      : "PRESS START. THE BROWSER WILL ASK TO USE YOUR MIC, SAY ALLOW"
     : noAudio
       ? "OPEN SOURCES ABOVE, OR TYPE A LINE IN THE LOG"
       : "PRESS 1 TO 8 FOR AN INSTANT LINE";
@@ -820,8 +820,9 @@ function CallScreen() {
             started={practice.started}
             over={practice.over}
             clientSpeaking={practice.clientSpeaking}
+            micOn={captures.rep && !muted.rep}
             busy={debriefLoading}
-            onStart={startPractice}
+            onStart={() => void startPractice()}
             onCutIn={cutIn}
             onEnd={endPractice}
           />

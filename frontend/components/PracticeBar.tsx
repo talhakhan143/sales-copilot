@@ -41,6 +41,13 @@ export interface PracticeBarProps {
   difficulty: Difficulty;
   /** True while the browser is speaking the client's line out loud. */
   clientSpeaking: boolean;
+  /**
+   * True when the rep's microphone is really capturing. The bar used to say
+   * "your microphone is on" from the speaking flag alone, so a rep whose mic
+   * had never started was told they were being heard while they talked into
+   * nothing. It says what is true now.
+   */
+  micOn: boolean;
   /** True while a request to the server is in flight. */
   busy: boolean;
   onStart(): void;
@@ -95,6 +102,7 @@ export function PracticeBar({
   onStart,
   onCutIn,
   onEnd,
+  micOn,
 }: PracticeBarProps) {
   const live = started && !over;
   const canCutIn = live && clientSpeaking && !busy;
@@ -143,7 +151,7 @@ export function PracticeBar({
      The mark vocabulary is the status pill's: hollow means nothing is happening,
      solid means it is, and a breathing solid accent mark means live audio. */
   let markClass = "border border-line-strong";
-  let line = "The client talks first. Read the line on the screen out loud.";
+  let line = "The client talks first. We turn your mic on when you press start.";
   let lineClass = "text-muted";
   let hint = "";
 
@@ -158,6 +166,13 @@ export function PracticeBar({
     /* The one line that tells a rep how to get the microphone back, so it says
        it in plain words. The button beside it keeps its short label. */
     hint = "Your mic is off while they talk. Press space to talk now";
+  } else if (started && !micOn) {
+    // The honest branch. The rep is being asked to speak into a microphone that
+    // is not running, so say so and give them the one thing that still works.
+    markClass = "bg-warn";
+    line = "Your turn, but your mic is off.";
+    lineClass = "text-warn";
+    hint = "Let the browser use your mic, or type your line in the log";
   } else if (started) {
     markClass = "bg-accent-2";
     line = "Your turn. Say your line now.";
@@ -215,7 +230,9 @@ export function PracticeBar({
           : clientSpeaking
             ? "The client is talking. Your microphone is off. Press space to talk now."
             : started
-              ? "Your turn. Your microphone is on."
+              ? micOn
+                ? "Your turn. Your microphone is on."
+                : "Your turn, but your microphone is off. Type your line in the log instead."
               : ""}
       </span>
 

@@ -140,7 +140,7 @@ export interface PracticeApi {
   /** Milliseconds since the rep pressed start. Frozen when the call ends. */
   elapsedMs: number;
   /** Prime the voice engine and ask the client to speak first. */
-  startPractice(): void;
+  startPractice(): Promise<void>;
   /** Stop the call and ask the server for a score. */
   endPractice(): void;
   /** Cut the client off mid word and take the microphone back. */
@@ -181,7 +181,7 @@ export interface TeleprompterApi {
    * `practice`. They are here as well so a component can take them straight off
    * the hook, next to quickAction and reset, without unpacking practice first.
    */
-  startPractice(): void;
+  startPractice(): Promise<void>;
   endPractice(): void;
   cutIn(): void;
 }
@@ -1217,7 +1217,7 @@ export function useTeleprompter(
    * line arrives over the socket, is too late and the line is dropped without
    * an error.
    */
-  const startPractice = useCallback(() => {
+  const startPractice = useCallback(async () => {
     // Priming comes first, before any early return, because this is the one
     // moment we are certain a real click is on the stack. A click that could not
     // reach the server still leaves the engine unlocked for the next try.
@@ -1227,6 +1227,20 @@ export function useTeleprompter(
     if (!socket || socket.state !== "open") {
       setError("Not connected to the server yet, so the practice call could not start.");
       return;
+    }
+
+    // Turn the microphone on here, and only here. A practice call needs exactly
+    // one input, the rep's own voice, and this click is the user gesture that
+    // getUserMedia demands. Making the rep find the source picker first was the
+    // whole reason a rep could talk into a dead microphone and never be heard.
+    // A refused microphone is not fatal: they can still type their line into the
+    // log, so the call starts either way and the bar says which it is.
+    if (!capturesRef.current.rep) {
+      try {
+        await startStream("rep", {});
+      } catch {
+        // startStream already put a readable sentence into error state.
+      }
     }
 
     practiceStartedAtRef.current = Date.now();
@@ -1239,7 +1253,7 @@ export function useTeleprompter(
     setError(null);
 
     socket.send({ type: "practice_start" });
-  }, []);
+  }, [startStream]);
 
   /**
    * Stop the rehearsal and ask for a score.
