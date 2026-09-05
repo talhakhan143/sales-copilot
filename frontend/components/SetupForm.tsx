@@ -1,0 +1,897 @@
+"use client";
+
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArrowRight,
+  Check,
+  ChevronRight,
+  Copy,
+  Crosshair,
+  Globe,
+  RotateCcw,
+  ServerCrash,
+  Sparkles,
+  TriangleAlert,
+  X,
+} from "lucide-react";
+
+import { LANGUAGES } from "@/lib/config";
+import { clearSession, loadSession, saveSession } from "@/lib/session";
+import type { PreparedSession } from "@/lib/types";
+
+/* ============================================================
+   CONSTANTS
+   ============================================================ */
+
+/** The server keeps this many characters of the what you sell (backend MAX_KB_LETTERS). */
+const KB_KEPT = 24_000;
+/** The request validator's hard ceiling. Past this the submit is blocked. */
+const KB_LIMIT = 40_000;
+/** How long the copy receipt stays on screen. Matches the .copy-ack keyframe. */
+const COPY_ACK_MS = 1020;
+/** Health poll interval for the header pill. */
+const HEALTH_POLL_MS = 15_000;
+
+const MICRO_BUTTON =
+  "flex h-[22px] shrink-0 items-center gap-1.5 rounded-hair border border-line-strong px-2 font-mono text-micro uppercase text-muted transition-colors duration-[120ms] ease-out hover:bg-surface-2 hover:text-text";
+
+const PRIMARY_BUTTON =
+  "relative flex h-12 w-full items-center justify-center gap-2 overflow-hidden rounded-hair bg-accent font-mono text-[12px] font-semibold uppercase tracking-[0.12em] text-[#04121A] transition-opacity duration-[120ms] ease-out";
+
+const FIELD_LABEL = "font-mono text-micro uppercase text-muted";
+const FIELD_DESC = "font-sans text-[12px] leading-[18px] text-muted";
+const FIELD_INPUT =
+  "h-11 w-full rounded-hair border border-line-strong bg-surface-2 pl-9 pr-3 font-sans text-body text-text placeholder:text-dim";
+const FIELD_ICON =
+  "pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-dim";
+
+const SAMPLE_KNOWLEDGE_BASE = `Northbeam Studio, a six person web development and automation agency in Lahore. We have shipped for clients in the US, UK and UAE since 2019.
+
+WHAT WE SELL
+1. Marketing sites on Next.js. Two to four weeks. 3,500 to 9,000 USD.
+2. Custom web apps and client portals. Six to twelve weeks. 12,000 to 40,000 USD.
+3. Workflow automation. We wire the CRM, the forms, the invoicing and the email together so nobody copies data by hand. 1,800 to 6,000 USD to build, 400 USD a month to keep running.
+4. Care plan. Hosting, updates, small changes, reply inside 24 hours. 350 USD a month.
+
+WHY US
+Fixed price and fixed date, written into the contract before we start. One senior developer owns your account, there are no juniors rotating through it. You get the code and the repository on day one, so you own everything we build.
+
+PROOF
+Aster Dental, 42 clinics. Their booking portal cut inbound phone calls by 61 percent in four months.
+Vellum Legal. Intake automation saved 22 staff hours a week and paid for itself in seven weeks.
+38 projects delivered, 3 of them late, and every one of those three shipped inside the same month.
+
+COMMON OBJECTIONS
+"You are too expensive." A cheap site that gets rebuilt twice costs more than one built right. The price and the date are fixed in writing, and I can send you the Aster numbers before you pay anything.
+
+"We already have a developer." Good, we work next to them. Most clients start us on the automation their developer never has time for, and nobody has to be replaced.`;
+
+/* ============================================================
+   HEALTH PILL (header, client side polling)
+   ============================================================ */
+
+type HealthState = "checking" | "ok" | "nokey" | "down";
+
+interface HealthPayload {
+  status?: string;
+  groqConfigured?: boolean;
+  sessions?: number;
+  version?: string;
+  detail?: string;
+  models?: { stt?: string; llm?: string };
+}
+
+const HEALTH_VIEW: Record<
+  HealthState,
+  { word: string; mark: string; wordClass: string; border: string; title: string }
+> = {
+  checking: {
+    word: "Checking",
+    mark: "border border-line-strong bg-transparent",
+    wordClass: "text-muted",
+    border: "border-line-strong",
+    title: "Checking if the server is up",
+  },
+  ok: {
+    word: "API ok",
+    mark: "bg-ok",
+    wordClass: "text-text",
+    border: "border-line-strong",
+    title: "Server is up and the Groq key is set",
+  },
+  nokey: {
+    word: "No Groq key",
+    mark: "bg-warn",
+    wordClass: "text-text",
+    border: "border-line-strong",
+    title: "Server is up but GROQ_API_KEY is empty, so speech and answers will not work",
+  },
+  down: {
+    word: "API down",
+    mark: "bg-danger",
+    wordClass: "text-danger",
+    border: "border-danger",
+    title: "The server is not answering",
+  },
+};
+
+/**
+ * The model strip in the page footer.
+ *
+ * The model ids are read from the live backend rather than hardcoded, because
+ * an operator can swap either one through the environment and a stale name in
+ * the footer would be a lie. Fetched once, no polling, silent when the backend
+ * is not up.
+ */
+export function ModelStrip() {
+  const [models, setModels] = useState<{ stt: string; llm: string } | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const controller = new AbortController();
+
+    void (async () => {
+      try {
+        const res = await fetch("/api/health", { cache: "no-store", signal: controller.signal });
+        if (!alive || !res.ok) return;
+        const data = (await res.json()) as HealthPayload;
+        if (!alive || !data.models?.stt || !data.models?.llm) return;
+        setModels({ stt: data.models.stt, llm: data.models.llm });
+      } catch {
+        // The health pill already tells the user the backend is down.
+      }
+    })();
+
+    return () => {
+      alive = false;
+      controller.abort();
+    };
+  }, []);
+
+  if (!models) {
+    return <span className="font-mono text-micro uppercase text-dim">Groq free tier</span>;
+  }
+
+  return (
+    <span className="font-mono text-micro uppercase text-muted">
+      {models.stt} plus {models.llm}
+    </span>
+  );
+}
+
+export function HealthPill() {
+  const [state, setState] = useState<HealthState>("checking");
+
+  useEffect(() => {
+    let alive = true;
+    const controller = new AbortController();
+
+    const poll = async () => {
+      try {
+        const res = await fetch("/api/health", { cache: "no-store", signal: controller.signal });
+        if (!alive) return;
+        if (!res.ok) {
+          setState("down");
+          return;
+        }
+        const data = (await res.json()) as HealthPayload;
+        if (!alive) return;
+        if (data.status !== "ok") {
+          setState("down");
+          return;
+        }
+        setState(data.groqConfigured ? "ok" : "nokey");
+      } catch {
+        if (alive) setState("down");
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(() => {
+      void poll();
+    }, HEALTH_POLL_MS);
+
+    return () => {
+      alive = false;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const view = HEALTH_VIEW[state];
+
+  return (
+    <div
+      className={`relative flex h-[26px] min-w-[116px] items-center gap-2 rounded-hair border px-2.5 ${view.border}`}
+      title={view.title}
+    >
+      <span className={`h-1.5 w-1.5 shrink-0 ${view.mark}`} aria-hidden="true" />
+      <span className={`font-mono text-status uppercase ${view.wordClass}`} aria-live="polite">
+        {view.word}
+      </span>
+    </div>
+  );
+}
+
+/* ============================================================
+   URL NORMALISATION (mirrors the backend normalize_url and its SSRF guard)
+   ============================================================ */
+
+type UrlState =
+  | { kind: "empty" }
+  | { kind: "ok"; url: string }
+  | { kind: "bad"; reason: string };
+
+const PRIVATE_HOST =
+  /^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)$/i;
+
+function normalizeUrl(raw: string): UrlState {
+  const trimmed = raw.trim();
+  if (!trimmed) return { kind: "empty" };
+  if (/\s/.test(trimmed)) return { kind: "bad", reason: "A web address cannot contain a space." };
+
+  const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed);
+  let parsed: URL;
+  try {
+    parsed = new URL(hasScheme ? trimmed : `https://${trimmed}`);
+  } catch {
+    return { kind: "bad", reason: "That does not look like a web address." };
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { kind: "bad", reason: "Only http and https addresses can be fetched." };
+  }
+
+  const host = parsed.hostname;
+  if (!host) return { kind: "bad", reason: "That address is missing the site name." };
+  if (
+    PRIVATE_HOST.test(host) ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".localhost")
+  ) {
+    return { kind: "bad", reason: "Private and local addresses cannot be read." };
+  }
+  if (!host.includes(".")) {
+    return { kind: "bad", reason: "Add the ending too, like acme.com." };
+  }
+
+  const bare = parsed.pathname === "/" && !parsed.search && !parsed.hash;
+  return { kind: "ok", url: bare ? `${parsed.protocol}//${parsed.host}` : parsed.toString() };
+}
+
+/* ============================================================
+   PREPARE CONTEXT RESPONSE
+   ============================================================ */
+
+interface PrepareResponse {
+  sessionId: string;
+  systemPrompt: string;
+  clientUrl: string | null;
+  clientTitle: string | null;
+  clientExcerpt: string | null;
+  scrapeChars: number;
+  scrapeOk: boolean;
+  scrapeError: string | null;
+  createdAt: number;
+}
+
+function isPrepareResponse(value: unknown): value is PrepareResponse {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.sessionId === "string" && typeof v.systemPrompt === "string";
+}
+
+/** Turns any non 200 payload into one sentence a human can act on. */
+function describeFailure(status: number, payload: unknown): string {
+  if (typeof payload === "object" && payload !== null) {
+    const v = payload as Record<string, unknown>;
+    if (typeof v.error === "string" && v.error) {
+      const detail = typeof v.detail === "string" && v.detail ? ` ${v.detail}` : "";
+      return `${v.error}.${detail}`;
+    }
+    if (Array.isArray(v.detail)) {
+      const first = v.detail[0];
+      if (typeof first === "object" && first !== null) {
+        const msg = (first as Record<string, unknown>).msg;
+        if (typeof msg === "string") return msg;
+      }
+    }
+    if (typeof v.detail === "string" && v.detail) return v.detail;
+  }
+  return `The backend answered ${status} and the reason was not readable.`;
+}
+
+/* ============================================================
+   THE FORM
+   ============================================================ */
+
+type Phase = "idle" | "fetching" | "fusing" | "ready";
+type Notice =
+  | { kind: "backend"; detail: string; hint: string }
+  | { kind: "request"; detail: string };
+type CopyState = "none" | "done" | "failed";
+
+const PHASE_LABEL: Record<Phase, string> = {
+  idle: "Set up the call",
+  fetching: "Fetching site",
+  fusing: "Fusing context",
+  ready: "Ready",
+};
+
+function shortId(id: string): string {
+  return id.replace(/-/g, "").slice(0, 4).toUpperCase();
+}
+
+function countLabel(chars: number): string {
+  const n = chars.toLocaleString("en-US");
+  if (chars > KB_LIMIT) return `${n} letters, limit ${KB_LIMIT.toLocaleString("en-US")}`;
+  if (chars > KB_KEPT) return `${n} letters, first ${KB_KEPT.toLocaleString("en-US")} kept`;
+  return `${n} letters`;
+}
+
+export function SetupForm() {
+  const router = useRouter();
+  const formRef = useRef<HTMLFormElement>(null);
+  const copyTimer = useRef<number | null>(null);
+
+  const [knowledgeBase, setKnowledgeBase] = useState("");
+  const [urlRaw, setUrlRaw] = useState("");
+  const [clientNotes, setClientNotes] = useState("");
+  const [goal, setGoal] = useState("");
+  const [language, setLanguage] = useState(LANGUAGES[0]?.code ?? "en");
+
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [result, setResult] = useState<PreparedSession | null>(null);
+  const [resume, setResume] = useState<PreparedSession | null>(null);
+  const [copy, setCopy] = useState<CopyState>("none");
+
+  /* A saved session means the rep can walk straight back into a call after a refresh. */
+  useEffect(() => {
+    // localStorage does not exist during the prerender, so this cannot be a
+    // lazy initial state without the server and the client disagreeing about
+    // whether to paint the resume link.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setResume(loadSession());
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    };
+  }, []);
+
+  const urlState = useMemo(() => normalizeUrl(urlRaw), [urlRaw]);
+
+  const letters = knowledgeBase.length;
+  const overLimit = letters > KB_LIMIT;
+  const emptyKb = knowledgeBase.trim().length === 0;
+  const busy = phase === "fetching" || phase === "fusing";
+  const blocked = emptyKb || overLimit || urlState.kind === "bad";
+  const buttonDisabled = blocked || busy || phase === "ready";
+
+  const counterTone = overLimit ? "text-danger" : letters > KB_KEPT ? "text-warn" : "text-dim";
+
+  /** Any edit invalidates a built context, so the button becomes live again. */
+  const invalidate = useCallback(() => {
+    setPhase((p) => (p === "ready" ? "idle" : p));
+  }, []);
+
+  const build = useCallback(async () => {
+    if (blocked || busy) return;
+    setNotice(null);
+    setCopy("none");
+
+    const clientUrl = urlState.kind === "ok" ? urlState.url : null;
+    /* The phase machine is driven by real milestones, never by a timer.
+       1. A URL was given, so the backend is out fetching it.
+       2. The response headers arrived, so the fetch is over and the prompt is being fused.
+       3. The payload parsed and the session was saved. */
+    setPhase(clientUrl ? "fetching" : "fusing");
+
+    let res: Response;
+    try {
+      res = await fetch("/api/prepare-context", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          knowledgeBase: knowledgeBase.trim(),
+          clientUrl,
+          clientContext: clientNotes.trim() || null,
+          callGoal: goal.trim() || null,
+          language,
+        }),
+      });
+    } catch (err) {
+      setPhase("idle");
+      setNotice({
+        kind: "request",
+        detail: err instanceof Error ? err.message : "The app could not send the request.",
+      });
+      return;
+    }
+
+    setPhase("fusing");
+
+    let payload: unknown = null;
+    try {
+      payload = (await res.json()) as unknown;
+    } catch {
+      payload = null;
+    }
+
+    if (!res.ok) {
+      setPhase("idle");
+      const v = (payload ?? {}) as Record<string, unknown>;
+      /* Only the proxy's own "Backend unreachable" gets the start command notice.
+         Every other 502 came from a backend that did answer, just badly. */
+      if (res.status === 502 && v.error === "Backend unreachable") {
+        setNotice({
+          kind: "backend",
+          detail:
+            typeof v.detail === "string" && v.detail
+              ? v.detail
+              : "The web app could not reach the server.",
+          hint: typeof v.hint === "string" && v.hint ? v.hint : "cd backend && ./run.sh",
+        });
+      } else {
+        setNotice({ kind: "request", detail: describeFailure(res.status, payload) });
+      }
+      return;
+    }
+
+    if (!isPrepareResponse(payload)) {
+      setPhase("idle");
+      setNotice({
+        kind: "request",
+        detail: "The server answered, but it did not send a call id.",
+      });
+      return;
+    }
+
+    const session: PreparedSession = {
+      sessionId: payload.sessionId,
+      systemPrompt: payload.systemPrompt,
+      clientUrl: payload.clientUrl,
+      clientTitle: payload.clientTitle,
+      clientExcerpt: payload.clientExcerpt,
+      scrapeChars: payload.scrapeChars,
+      scrapeOk: payload.scrapeOk,
+      scrapeError: payload.scrapeError,
+      hasNotes: clientNotes.trim().length > 0,
+      createdAt: payload.createdAt,
+      language,
+    };
+
+    saveSession(session);
+    setResult(session);
+    setResume(null);
+    setPhase("ready");
+  }, [blocked, busy, clientNotes, goal, knowledgeBase, language, urlState]);
+
+  const onSubmit = useCallback(
+    (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      void build();
+    },
+    [build],
+  );
+
+  /* Cmd or Ctrl plus Enter submits from any field in the form. */
+  const onKeyDown = useCallback((event: React.KeyboardEvent<HTMLFormElement>) => {
+    if (event.key !== "Enter") return;
+    if (!event.metaKey && !event.ctrlKey) return;
+    event.preventDefault();
+    formRef.current?.requestSubmit();
+  }, []);
+
+  const copyPrompt = useCallback(async () => {
+    if (!result) return;
+    let ok = true;
+    try {
+      await navigator.clipboard.writeText(result.systemPrompt);
+    } catch {
+      ok = false;
+    }
+    setCopy(ok ? "done" : "failed");
+    if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    copyTimer.current = window.setTimeout(() => setCopy("none"), COPY_ACK_MS);
+  }, [result]);
+
+  const discardResume = useCallback(() => {
+    clearSession();
+    setResume(null);
+  }, []);
+
+  const openTeleprompter = useCallback(() => {
+    if (!result) return;
+    router.push(`/call?session=${encodeURIComponent(result.sessionId)}`);
+  }, [result, router]);
+
+  const primaryClass = `${PRIMARY_BUTTON} ${
+    busy || phase === "ready"
+      ? "pointer-events-none"
+      : blocked
+        ? "pointer-events-none opacity-40"
+        : "hover:opacity-90"
+  }`;
+
+  return (
+    <form ref={formRef} onSubmit={onSubmit} onKeyDown={onKeyDown} className="mt-10" noValidate>
+      {resume && !result ? (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-hair border border-line-strong bg-surface px-4 py-2.5">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className={FIELD_LABEL}>Your last call</span>
+            <span className="truncate font-sans text-body text-text">
+              {resume.clientTitle ?? resume.clientUrl ?? "Client not named"}
+            </span>
+            <span className="shrink-0 font-mono text-micro uppercase tabnum text-dim">
+              Ses {shortId(resume.sessionId)}
+            </span>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Link
+              href={`/call?session=${encodeURIComponent(resume.sessionId)}`}
+              className={MICRO_BUTTON}
+            >
+              <ArrowRight className="h-3 w-3" aria-hidden="true" />
+              Go back to your last call
+            </Link>
+            <button
+              type="button"
+              onClick={discardResume}
+              className={MICRO_BUTTON}
+              title="Forget the saved call on this browser"
+            >
+              <X className="h-3 w-3" aria-hidden="true" />
+              Discard
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="seam-grid grid-cols-1 lg:grid-cols-[1.15fr_1fr]">
+        {/* KNOWLEDGE BASE */}
+        <section className="flex flex-col gap-3 bg-surface p-5">
+          <div className="flex items-center justify-between gap-3">
+            <label htmlFor="kb" className={FIELD_LABEL}>
+              What you sell
+            </label>
+            <button
+              type="button"
+              className={MICRO_BUTTON}
+              title="Puts a full example in the box"
+              onClick={() => {
+                setKnowledgeBase(SAMPLE_KNOWLEDGE_BASE);
+                invalidate();
+              }}
+            >
+              <Sparkles className="h-3 w-3" aria-hidden="true" />
+              Load sample
+            </button>
+          </div>
+          <p id="kb-desc" className={FIELD_DESC}>
+            What you sell, your prices, your proof, and the objections you keep hearing. The
+            copilot can only say what is written here, so be exact and use real numbers.
+          </p>
+          <textarea
+            id="kb"
+            name="knowledgeBase"
+            value={knowledgeBase}
+            spellCheck={false}
+            aria-describedby="kb-desc kb-count"
+            aria-invalid={overLimit}
+            onChange={(e) => {
+              setKnowledgeBase(e.target.value);
+              invalidate();
+            }}
+            placeholder="What you sell, your prices, why you are better, your proof, and the two objections you hear most."
+            className="min-h-[260px] w-full resize-y rounded-hair border border-line-strong bg-surface-2 p-3 font-mono text-chip leading-5 text-text placeholder:text-dim"
+          />
+          <span
+            id="kb-count"
+            className={`self-end font-mono text-micro uppercase tabnum ${counterTone}`}
+          >
+            {countLabel(letters)}
+          </span>
+        </section>
+
+        {/* CLIENT */}
+        <section className="flex flex-col gap-3 bg-surface p-5">
+          <div className="flex items-center justify-between gap-3">
+            <span className={FIELD_LABEL}>Client</span>
+            <span className="font-mono text-micro uppercase text-dim">All optional</span>
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="url" className={FIELD_LABEL}>
+              Client website
+            </label>
+            <p id="url-desc" className={FIELD_DESC}>
+              Just the domain is fine. We read the page once and add it to your notes.
+            </p>
+            <div className="relative">
+              <Globe className={FIELD_ICON} aria-hidden="true" />
+              <input
+                id="url"
+                name="clientUrl"
+                type="text"
+                inputMode="url"
+                autoComplete="url"
+                spellCheck={false}
+                value={urlRaw}
+                aria-describedby="url-desc url-hint"
+                aria-invalid={urlState.kind === "bad"}
+                onChange={(e) => {
+                  setUrlRaw(e.target.value);
+                  invalidate();
+                }}
+                placeholder="acme.com"
+                className={FIELD_INPUT}
+              />
+            </div>
+            <p
+              id="url-hint"
+              className={`font-mono text-micro font-normal tracking-[0.04em] ${
+                urlState.kind === "bad" ? "text-danger" : "text-muted"
+              }`}
+            >
+              {urlState.kind === "ok"
+                ? `Will fetch ${urlState.url}`
+                : urlState.kind === "bad"
+                  ? urlState.reason
+                  : "No website? Leave this empty and use the box below."}
+            </p>
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="client-notes" className={FIELD_LABEL}>
+              About the client
+            </label>
+            <p id="client-notes-desc" className={FIELD_DESC}>
+              No website? Write it here instead. Their trade, their city, their size, and how
+              they get customers today. This is what you use when you are selling them their
+              first website.
+            </p>
+            <textarea
+              id="client-notes"
+              name="clientContext"
+              rows={4}
+              value={clientNotes}
+              aria-describedby="client-notes-desc"
+              onChange={(e) => {
+                setClientNotes(e.target.value);
+                invalidate();
+              }}
+              placeholder="Al Madina Auto Parts, a spare parts shop in Lahore. No website. They sell on WhatsApp and a Facebook page with 4,000 followers. Eight staff, walk in customers plus phone orders."
+              className={`${FIELD_INPUT} min-h-[104px] resize-y py-2.5 leading-[1.55]`}
+            />
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="goal" className={FIELD_LABEL}>
+              Call goal
+            </label>
+            <p id="goal-desc" className={FIELD_DESC}>
+              One line. What would make this call a win.
+            </p>
+            <div className="relative">
+              <Crosshair className={FIELD_ICON} aria-hidden="true" />
+              <input
+                id="goal"
+                name="callGoal"
+                type="text"
+                value={goal}
+                aria-describedby="goal-desc"
+                onChange={(e) => {
+                  setGoal(e.target.value);
+                  invalidate();
+                }}
+                placeholder="Book a 20 minute demo with the marketing lead"
+                className={FIELD_INPUT}
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="lang" className={FIELD_LABEL}>
+              Language
+            </label>
+            <p id="lang-desc" className={FIELD_DESC}>
+              The language the copilot writes in. This is the language you will speak.
+            </p>
+            <select
+              id="lang"
+              name="language"
+              value={language}
+              aria-describedby="lang-desc"
+              onChange={(e) => {
+                setLanguage(e.target.value);
+                invalidate();
+              }}
+              className="h-11 w-full rounded-hair border border-line-strong bg-surface-2 px-3 font-sans text-body text-text"
+            >
+              {LANGUAGES.map((item) => (
+                <option key={item.code} value={item.code}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </section>
+      </div>
+
+      {/* PRIMARY ACTION */}
+      <button type="submit" disabled={buttonDisabled} className={`${primaryClass} mt-4`}>
+        {phase === "ready" ? <Check className="h-3.5 w-3.5" aria-hidden="true" /> : null}
+        <span aria-live="polite">{PHASE_LABEL[phase]}</span>
+        {busy ? (
+          <span
+            className="absolute inset-x-0 bottom-0 h-0.5 overflow-hidden bg-[#04121A]/30"
+            aria-hidden="true"
+          >
+            <span className="block h-full w-2/5 bg-[#04121A] animate-sweep" />
+          </span>
+        ) : null}
+      </button>
+      <p className="mt-2 text-center font-mono text-micro uppercase text-muted">
+        {emptyKb
+          ? "Write what you sell to carry on"
+          : overLimit
+            ? "Make it shorter than 40,000 letters"
+            : "Press Cmd or Ctrl and Enter from any box"}
+      </p>
+
+      {/* FAILURE NOTICES */}
+      {notice?.kind === "backend" ? (
+        <div className="mt-4 flex gap-3 border-l-2 border-danger bg-surface-2 p-3">
+          <ServerCrash className="mt-0.5 h-4 w-4 shrink-0 text-danger" aria-hidden="true" />
+          <div className="flex min-w-0 flex-col gap-2">
+            <p className="text-body text-muted">
+              The FastAPI backend is not running, so there is nothing to build the context with.
+              Start it in a second terminal and press the button again.
+            </p>
+            <code className="block overflow-x-auto rounded-hair border border-line bg-bg p-2 font-mono text-[12px] leading-[19px] text-text">
+              {notice.hint}
+            </code>
+            <p className="font-mono text-micro font-normal tracking-[0.04em] text-muted">
+              {notice.detail}
+            </p>
+          </div>
+        </div>
+      ) : null}
+
+      {notice?.kind === "request" ? (
+        <div className="mt-4 flex gap-3 border-l-2 border-danger bg-surface-2 p-3">
+          <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-danger" aria-hidden="true" />
+          <p className="text-body text-muted">{notice.detail}</p>
+        </div>
+      ) : null}
+
+      {/* RESULT */}
+      {result ? (
+        <section className="seam-grid mt-4 grid-cols-1" aria-label="Prepared call context">
+          <div className="flex flex-col gap-3 bg-surface p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <span className={FIELD_LABEL}>Your call is ready</span>
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={() => void copyPrompt()} className={MICRO_BUTTON}>
+                  <Copy className="h-3 w-3" aria-hidden="true" />
+                  Copy the notes
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPhase("idle")}
+                  className={MICRO_BUTTON}
+                  title="Turn the button back on so you can run it again"
+                >
+                  <RotateCcw className="h-3 w-3" aria-hidden="true" />
+                  Rebuild
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <p className="text-lede text-text">
+                {result.clientTitle ??
+                  (result.hasNotes
+                    ? "Notes built from what you sell and what you know about the client"
+                    : "Notes built from what you sell")}
+              </p>
+              {result.clientUrl ? (
+                <p className="break-all font-mono text-[12px] leading-[18px] text-dim">
+                  {result.clientUrl}
+                </p>
+              ) : null}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-4">
+              {result.clientUrl ? (
+                <span className="font-mono text-micro uppercase tabnum text-dim">
+                  {result.scrapeChars.toLocaleString("en-US")} letters read
+                </span>
+              ) : null}
+              <span className="font-mono text-micro uppercase tabnum text-dim">
+                Ses {shortId(result.sessionId)}
+              </span>
+              <span className="font-mono text-micro uppercase text-dim">
+                {LANGUAGES.find((l) => l.code === result.language)?.label ?? result.language}
+              </span>
+              {copy === "done" ? (
+                <span className="copy-ack font-mono text-micro uppercase text-ok">Copied</span>
+              ) : null}
+              {copy === "failed" ? (
+                <span className="copy-ack font-mono text-micro uppercase text-danger">
+                  Copy blocked by the browser
+                </span>
+              ) : null}
+            </div>
+
+            {!result.scrapeOk && result.clientUrl ? (
+              <div className="flex gap-3 border-l-2 border-warn bg-surface-2 p-3">
+                <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-warn" aria-hidden="true" />
+                <div className="flex min-w-0 flex-col gap-1">
+                  <p className="font-sans text-body text-muted">
+                    {result.hasNotes
+                      ? "Could not read that site. Your notes were built from what you sell and what you wrote about the client."
+                      : "Could not read that site. Your notes were built from what you sell only."}
+                  </p>
+                  {result.scrapeError ? (
+                    <p className="break-words font-mono text-micro font-normal tracking-[0.04em] text-dim">
+                      {result.scrapeError}
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+            ) : result.clientExcerpt ? (
+              <p className="line-clamp-2 font-sans text-[12px] leading-[18px] text-muted">
+                {result.clientExcerpt}
+              </p>
+            ) : result.hasNotes ? (
+              <p className="font-sans text-[12px] leading-[18px] text-muted">
+                No website was used. The copilot will work from what you wrote about the client.
+              </p>
+            ) : (
+              <p className="font-sans text-[12px] leading-[18px] text-muted">
+                No client details were given, so the copilot will ask questions before it makes any
+                claim. Add a website or a few lines about them for sharper answers.
+              </p>
+            )}
+
+            <details className="group">
+              <summary
+                className={`flex w-fit cursor-pointer list-none items-center gap-2 ${FIELD_LABEL} [&::-webkit-details-marker]:hidden`}
+              >
+                <ChevronRight
+                  className="h-3 w-3 transition-transform duration-[140ms] ease-out group-open:rotate-90"
+                  aria-hidden="true"
+                />
+                The notes
+              </summary>
+              <pre className="rail-scroll mt-2 max-h-[320px] whitespace-pre-wrap break-words rounded-hair border border-line bg-bg p-3 font-mono text-[12px] leading-[19px] text-muted">
+                {result.systemPrompt}
+              </pre>
+            </details>
+          </div>
+
+          <div className="bg-surface p-5">
+            <button
+              type="button"
+              onClick={openTeleprompter}
+              className={`${PRIMARY_BUTTON} hover:opacity-90`}
+            >
+              Open teleprompter
+              <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+            <p className="mt-2 text-center font-mono text-micro uppercase text-muted">
+              Saved on this browser, so a refresh keeps the call alive
+            </p>
+          </div>
+        </section>
+      ) : null}
+    </form>
+  );
+}

@@ -1,0 +1,626 @@
+@import "tailwindcss";
+
+/* ============================================================
+   1. RAW TOKENS
+   Design spec section 2.1. Values are load bearing, do not tune.
+   ============================================================ */
+
+:root {
+  color-scheme: dark;
+
+  /* ---------- ground and panels ---------- */
+  --bg: #07090D;              /* page ground AND the teleprompter panel (the inversion) */
+  --surface: #0D1117;         /* every instrument panel: bar, wave, rail, chips */
+  --surface-2: #131A24;       /* raised only: hover, popover body, inputs, textarea */
+
+  /* ---------- seams. Blue tinted so they read as etched, not as table borders ---------- */
+  --line: rgba(124, 164, 208, 0.10);
+  --line-strong: rgba(124, 164, 208, 0.20);
+
+  /* ---------- ink ---------- */
+  --text: #E8EDF5;            /* 16.1:1 on --surface. Teleprompter, values, chip labels */
+  --muted: #8A97AB;           /*  6.4:1 on --surface. Every label, hint, secondary body */
+  --dim: #4B5768;             /*  2.6:1 on --surface. NEVER text that must be read */
+
+  /* ---------- signal ---------- */
+  --accent: #6EE7FF;          /* INBOUND and LIVE: prospect audio, link, progress, boresight */
+  --accent-2: #A78BFA;        /* OUTBOUND and MACHINE: rep mic, copilot, caret, thinking */
+  --warn: #FBBF24;            /* exception only */
+  --danger: #FB7185;          /* exception only */
+  --ok: #34D399;              /* exception only, and rare */
+
+  /* ---------- pre resolved alphas. Never recompute these inline or in canvas code ---------- */
+  --accent-a08: rgba(110, 231, 255, 0.08);
+  --accent-a16: rgba(110, 231, 255, 0.16);
+  --accent-a22: rgba(110, 231, 255, 0.22);
+  --accent-a35: rgba(110, 231, 255, 0.35);
+  --accent-a55: rgba(110, 231, 255, 0.55);
+  --accent2-a16: rgba(167, 139, 250, 0.16);
+  --accent2-a40: rgba(167, 139, 250, 0.40);
+  --accent2-a55: rgba(167, 139, 250, 0.55);
+  --danger-a16: rgba(251, 113, 133, 0.16);
+  --warn-a16: rgba(251, 191, 36, 0.16);
+
+  /* ---------- teleprompter metrics. Overridden per breakpoint in section 4 ---------- */
+  --tp-size: 30px;
+  --tp-line: 38px;
+  --tp-track: -0.008em;
+  --tp-measure: 22ch;
+  --tp-fit: 1;                /* 1 | 0.90 | 0.80, set on suggestion_done only */
+  --tp-gutter: 20px;          /* boresight and ask tick column */
+  --tp-pad-x: 20px;
+  --tp-pad-t: 16px;
+  --tp-pad-b: 20px;
+  --tp-head: 32px;            /* head strip height */
+  --bore-top: 24px;           /* distance from head strip bottom to boresight top */
+  --bore-h: 20px;
+
+  /* ---------- radius. Nothing in this product is rounder than 4px ---------- */
+  --r-hair: 2px;
+  --r-cell: 4px;
+  --r-pop: 4px;
+
+  /* ---------- shadow. Exactly two exist ---------- */
+  --sh-caret: 0 0 10px rgba(167, 139, 250, 0.45);
+  --sh-pop: 0 12px 32px rgba(0, 0, 0, 0.55);
+
+  /* ---------- easing ---------- */
+  --e-out: cubic-bezier(.2, .8, .2, 1);
+  --e-in: cubic-bezier(.4, 0, 1, 1);
+  --e-lin: linear;
+
+  /* ---------- durations ---------- */
+  --d-flash: 90ms;
+  --d-exit: 110ms;
+  --d-base: 140ms;
+  --d-enter: 150ms;
+  --d-slow: 400ms;
+}
+
+/* ============================================================
+   2. TAILWIND v4 MAPPING
+   Design spec section 2.2. Every utility the components may use.
+   ============================================================ */
+
+@theme inline {
+  /* ---- colour: produces bg-*, text-*, border-*, ring-*, outline-*, fill-*, stroke-* ---- */
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-dim: var(--dim);
+  --color-accent: var(--accent);
+  --color-accent-2: var(--accent-2);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-ok: var(--ok);
+
+  /* ---- families: produces font-sans, font-mono ---- */
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* ---- sizes: produces text-micro, text-status, text-chip, text-body, text-value,
+          text-idle, text-lede, text-h1. Line height and tracking ride along. ---- */
+  --text-micro: 0.625rem;                 /* 10px */
+  --text-micro--line-height: 0.75rem;     /* 12px */
+  --text-micro--letter-spacing: 0.16em;
+  --text-micro--font-weight: 600;
+
+  --text-status: 0.6875rem;               /* 11px */
+  --text-status--line-height: 0.75rem;    /* 12px */
+  --text-status--letter-spacing: 0.14em;
+  --text-status--font-weight: 600;
+
+  --text-chip: 0.8125rem;                 /* 13px */
+  --text-chip--line-height: 1rem;         /* 16px */
+  --text-chip--letter-spacing: -0.005em;
+  --text-chip--font-weight: 500;
+
+  --text-body: 0.875rem;                  /* 14px */
+  --text-body--line-height: 1.25rem;      /* 20px */
+
+  --text-value: 1.125rem;                 /* 18px */
+  --text-value--line-height: 1.125rem;    /* 18px */
+  --text-value--font-weight: 500;
+
+  --text-idle: 1rem;                      /* 16px */
+  --text-idle--line-height: 1.5rem;       /* 24px */
+
+  --text-lede: 0.9375rem;                 /* 15px */
+  --text-lede--line-height: 1.5rem;       /* 24px */
+
+  --text-h1: 1.875rem;                    /* 30px */
+  --text-h1--line-height: 2.25rem;        /* 36px */
+  --text-h1--letter-spacing: -0.02em;
+  --text-h1--font-weight: 600;
+
+  /* ---- radius: produces rounded-hair, rounded-cell, rounded-pop ---- */
+  --radius-hair: var(--r-hair);
+  --radius-cell: var(--r-cell);
+  --radius-pop: var(--r-pop);
+
+  /* ---- shadow: produces shadow-caret, shadow-pop ---- */
+  --shadow-caret: var(--sh-caret);
+  --shadow-pop: var(--sh-pop);
+
+  /* ---- easing: produces ease-out (overridden), ease-in (overridden), ease-lin ---- */
+  --ease-out: var(--e-out);
+  --ease-in: var(--e-in);
+  --ease-lin: var(--e-lin);
+
+  /* ---- animation: produces animate-breathe, animate-mark, animate-row-in,
+          animate-sweep, animate-latest-in ---- */
+  --animate-breathe: breathe 1400ms ease-in-out infinite;
+  --animate-mark: mark-pulse 1400ms ease-in-out infinite;
+  --animate-row-in: row-in 140ms var(--e-out) 1;
+  --animate-sweep: sweep 900ms linear infinite;
+  --animate-latest-in: latest-in 140ms var(--e-out) 1;
+}
+
+/* ============================================================
+   3. BASE LAYER
+   Design spec section 2.3, plus the scrollbar treatment.
+   ============================================================ */
+
+@layer base {
+  * { min-width: 0; }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+  }
+
+  body {
+    font-family: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+    overscroll-behavior: none;
+  }
+
+  /* The call page sets data-lock="1" on <html> in a useEffect and removes it on unmount.
+     The setup page scrolls; the call page never does, at any width. */
+  html[data-lock="1"],
+  html[data-lock="1"] body {
+    overflow: hidden;
+    overscroll-behavior: none;
+    height: 100%;
+  }
+
+  input, select, textarea, button, th, td { font: inherit; color: inherit; }
+
+  ::selection { background: var(--accent-a35); color: var(--text); }
+
+  /* Scrollbars: thin and subtle everywhere. Firefox first, then webkit. */
+  html { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; }
+  ::-webkit-scrollbar-corner { background: transparent; }
+
+  /* The single focus ring. 2px accent, 2px offset. Never restyled per component. */
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--r-hair);
+  }
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus:not(:focus-visible) {
+    outline: none;
+  }
+}
+
+/* ============================================================
+   4. TELEPROMPTER METRIC BREAKPOINTS
+   Design spec section 2.4.
+   ============================================================ */
+
+/* 640 to 1023: tablet and large phone landscape */
+@media (min-width: 640px) {
+  :root {
+    --tp-size: 36px;
+    --tp-line: 45px;
+    --tp-track: -0.011em;
+    --tp-measure: 24ch;
+    --tp-gutter: 24px;
+    --tp-pad-x: 26px;
+    --tp-pad-t: 18px;
+    --tp-pad-b: 24px;
+    --bore-top: 26px;
+    --bore-h: 24px;
+  }
+}
+
+/* 1024 to 1439: the laptop. This is the primary target. */
+@media (min-width: 1024px) {
+  :root {
+    --tp-size: 44px;
+    --tp-line: 55px;
+    --tp-track: -0.013em;
+    --tp-measure: 26ch;
+    --tp-gutter: 28px;
+    --tp-pad-x: 32px;
+    --tp-pad-t: 20px;
+    --tp-pad-b: 28px;
+    --tp-head: 32px;
+    --bore-top: 30px;
+    --bore-h: 30px;
+  }
+}
+
+/* 1440 and up: deeper desk, external display */
+@media (min-width: 1440px) {
+  :root {
+    --tp-size: 46px;
+    --tp-line: 56px;
+    --tp-track: -0.014em;
+    --tp-measure: 26ch;
+    --tp-gutter: 28px;
+    --tp-pad-x: 36px;
+    --tp-pad-t: 22px;
+    --tp-pad-b: 30px;
+    --tp-head: 34px;
+    --bore-top: 32px;
+    --bore-h: 32px;
+  }
+}
+
+/* ============================================================
+   5. LAYOUT PRIMITIVES
+   Design spec section 2.5.
+   ============================================================ */
+
+/* The whole design. gap:1px on a --line-strong ground, every child paints its own
+   background, so the gap IS the hairline. No borders, no cards, no page margin. */
+.seam-grid {
+  display: grid;
+  gap: 1px;
+  background: var(--line-strong);
+}
+
+.panel        { background: var(--surface); min-width: 0; min-height: 0; }
+.panel-glass  { background: var(--bg);      min-width: 0; min-height: 0; }
+
+.tabnum { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
+.rail-scroll {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+.rail-scroll::-webkit-scrollbar { width: 8px; }
+.rail-scroll::-webkit-scrollbar-track { background: transparent; }
+.rail-scroll::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; }
+
+/* ============================================================
+   6. TELEPROMPTER
+   ============================================================ */
+
+.tp-text {
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  font-weight: 500;
+  font-size: calc(var(--tp-size) * var(--tp-fit));
+  line-height: calc(var(--tp-line) * var(--tp-fit));
+  letter-spacing: var(--tp-track);
+  color: var(--text);
+  max-width: min(var(--tp-measure), 100%);
+  align-content: start;
+  /* BANNED: text-wrap:pretty and text-wrap:balance. Both re-break earlier lines when a
+     new word arrives, which moves text under a reading eye. */
+  text-wrap: wrap;
+  transition: font-size 120ms var(--e-out), line-height 120ms var(--e-out);
+  /* Reserve four lines so a one word suggestion and a forty word suggestion start
+     on the same pixel. */
+  min-height: calc(4 * var(--tp-line) * var(--tp-fit));
+}
+
+/* Sentence blocks. */
+.tp-sentence { display: block; position: relative; }
+.tp-sentence + .tp-sentence { margin-top: 0.42em; }
+
+/* The ask tick. Only rendered when there are 2 or more sentences AND the last ends in "?". */
+.tp-sentence[data-ask="1"]::before {
+  content: "";
+  position: absolute;
+  left: calc(-1 * var(--tp-gutter));
+  top: 0.22em;
+  width: 2px;
+  height: 0.62em;
+  background: var(--accent);
+  opacity: 0.75;
+  border-radius: 1px;
+}
+
+/* The boresight. Permanent fiducial at the cap height of line one.
+   Absolutely positioned against the teleprompter panel, x aligned with the ask tick. */
+.boresight {
+  position: absolute;
+  left: var(--tp-pad-x);
+  top: calc(var(--tp-head) + var(--bore-top));
+  width: 2px;
+  height: var(--bore-h);
+  background: var(--accent);
+  opacity: 0.55;
+  border-radius: 1px;
+  overflow: hidden;
+  transition: opacity var(--d-slow) var(--e-out), background-color var(--d-base) linear;
+  pointer-events: none;
+}
+.boresight[data-state="thinking"] { background: var(--accent-2); opacity: 1; }
+.boresight[data-state="thinking"]::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: linear-gradient(180deg, transparent 0%, #FFFFFF 50%, transparent 100%);
+  opacity: 0.85;
+  animation: bore-travel 420ms linear infinite;
+}
+.boresight[data-state="down"] { background: var(--danger); opacity: 1; }
+.boresight.is-ack { animation: bore-ack 490ms var(--e-out) 1; }
+
+/* The caret. Zero width in flow so it can never cause a wrap. */
+.caret {
+  position: relative;
+  display: inline-block;
+  width: 0;
+  height: 1em;
+  vertical-align: -0.14em;
+}
+.caret::after {
+  content: "";
+  position: absolute; left: 2px; top: 0;
+  width: 2px; height: 100%;
+  background: var(--accent-2);
+  box-shadow: var(--sh-caret);
+  border-radius: 1px;
+}
+@media (min-width: 1440px) { .caret::after { width: 3px; } }
+.caret[data-state="flowing"]::after { animation: none; opacity: 1; }
+.caret[data-state="stalled"]::after { animation: caret-stall 1100ms linear infinite; }
+.caret[data-state="done"]::after    { animation: caret-signoff 1120ms linear 1 forwards; }
+
+/* The streaming progress rail. Sits on the panel's top edge and doubles as the seam. */
+.tp-rail { position: absolute; inset: 0 0 auto 0; height: 2px; background: var(--line-strong); overflow: hidden; }
+.tp-rail-fill {
+  height: 100%; width: 100%;
+  background: var(--accent);
+  transform-origin: left;
+  transform: scaleX(0);
+  transition: transform 160ms var(--e-out), opacity 320ms linear;
+  will-change: transform;
+}
+.tp-rail.is-flash::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: var(--accent);
+  animation: rail-flash 290ms linear 1;
+}
+
+/* Suggestion swap. */
+.tp-exit  { animation: tp-exit  var(--d-exit)  var(--e-in)  1 forwards; }
+.tp-enter { animation: tp-enter var(--d-enter) var(--e-out) 1 both; }
+
+/* ============================================================
+   7. INSTRUMENTS
+   ============================================================ */
+
+.status-sweep { position: absolute; left: 0; bottom: -3px; height: 2px; width: 100%; overflow: hidden; }
+.status-sweep::after {
+  content: ""; position: absolute; top: 0; left: 0; bottom: 0;
+  width: 40%; background: var(--accent-2);
+  animation: sweep 900ms linear infinite;
+}
+
+/* Objection chip press. 90ms scale plus a 1px inset accent ring. */
+.chip-press { transition: transform 90ms var(--e-out), background-color 120ms var(--e-out); }
+.chip-press:active { transform: scale(.97); box-shadow: inset 0 0 0 1px var(--accent); }
+
+/* The 2px receipt bar that drains under a fired objection chip. */
+.chip-drain {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: var(--accent);
+  transform-origin: left;
+  animation: chip-drain 2000ms linear 1 forwards;
+}
+
+.copy-ack { animation: copy-ack 1020ms linear 1 forwards; }
+
+/* ============================================================
+   8. THE CALL GRID
+   Design spec sections 4.2 to 4.4. The frame is the grid.
+   ============================================================ */
+
+.call-grid {
+  height: 100dvh;
+  overflow: hidden;
+  display: grid;
+  gap: 1px;
+  background: var(--line-strong);
+  grid-template-columns: minmax(0, 1fr) 380px;
+  grid-template-rows: 56px minmax(0, 1fr) 84px 113px;
+  grid-template-areas:
+    "bar    bar"
+    "glass  rail"
+    "wave   rail"
+    "chips  chips";
+}
+
+@media (min-width: 1728px) {
+  .call-grid {
+    grid-template-columns: minmax(0, 1fr) 420px;
+    grid-template-rows: 56px minmax(0, 1fr) 92px 113px;
+  }
+}
+
+@media (min-width: 1024px) and (max-width: 1439.98px) {
+  .call-grid {
+    grid-template-columns: minmax(0, 1fr) 320px;
+    grid-template-rows: 52px minmax(0, 1fr) 72px 105px;
+  }
+}
+
+@media (max-width: 1023.98px) {
+  .call-grid {
+    height: 100dvh;
+    grid-template-columns: 1fr;
+    grid-template-rows:
+      48px
+      minmax(0, 1fr)
+      56px
+      calc(56px + env(safe-area-inset-bottom));
+    grid-template-areas: "bar" "glass" "wave" "chips";
+  }
+}
+
+/* ============================================================
+   9. KEYFRAMES
+   ============================================================ */
+
+@keyframes tp-exit {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(-8px); }
+}
+@keyframes tp-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes caret-stall {
+  0%, 49%   { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+@keyframes caret-signoff {
+  0%   { opacity: 1; }
+  21%  { opacity: 0; }
+  43%  { opacity: 1; }
+  64%  { opacity: 0; }
+  86%  { opacity: 0; }
+  100% { opacity: 0; }
+}
+@keyframes bore-travel {
+  from { transform: translateY(-110%); }
+  to   { transform: translateY(220%); }
+}
+@keyframes bore-ack {
+  0%   { opacity: 0.55; }
+  18%  { opacity: 1; }
+  100% { opacity: 0.55; }
+}
+@keyframes rail-flash {
+  0%   { opacity: 0; }
+  31%  { opacity: 1; }
+  52%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+@keyframes breathe {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 0.75; }
+}
+@keyframes mark-pulse {
+  0%, 100% { opacity: 0.40; }
+  50%      { opacity: 1; }
+}
+@keyframes sweep {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(250%); }
+}
+@keyframes row-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes latest-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes chip-drain {
+  from { transform: scaleX(1); }
+  to   { transform: scaleX(0); }
+}
+@keyframes copy-ack {
+  0%   { opacity: 0; }
+  12%  { opacity: 1; }
+  80%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+@keyframes spine-decay {
+  from { opacity: 1; }
+  to   { opacity: 0.55; }
+}
+.spine-flash { animation: spine-decay 500ms var(--e-out) 1 forwards; }
+
+/* ============================================================
+   10. REDUCED MOTION. Removes movement, never information.
+   ============================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+
+  /* Blanket: nothing loops, nothing travels, nothing longer than 1ms, EXCEPT the
+     explicit re-enables below. */
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Suggestion swap: no travel. Exit is instant, enter is a short opacity step. */
+  .tp-exit  { animation: none !important; opacity: 0 !important; }
+  .tp-enter { animation: rm-enter 90ms linear 1 both !important; animation-duration: 90ms !important; }
+  @keyframes rm-enter { from { opacity: 0.4; } to { opacity: 1; } }
+
+  /* Text never resizes. */
+  .tp-text { transition: none !important; }
+
+  /* Caret: static block. Stall and signoff carry state, so state is kept, motion is not. */
+  .caret[data-state="flowing"]::after { opacity: 1 !important; animation: none !important; }
+  .caret[data-state="stalled"]::after { opacity: 0.55 !important; animation: none !important; }
+  .caret[data-state="done"]::after    { opacity: 0 !important; animation: none !important; }
+
+  /* Boresight: thinking still reads as thinking, it just does not travel. */
+  .boresight { transition: none !important; }
+  .boresight[data-state="thinking"]::after { display: none !important; }
+  .boresight[data-state="thinking"] { background: var(--accent-2) !important; opacity: 1 !important; }
+  .boresight.is-ack { animation: none !important; opacity: 1 !important; }
+
+  /* Progress rail: no crawl. Solid at 40 percent while streaming, cleared on done. */
+  .tp-rail-fill {
+    transition: none !important;
+    transform: scaleX(1) !important;
+    opacity: 0.40 !important;
+  }
+  .tp-rail-fill[data-streaming="false"] { opacity: 0 !important; }
+  .tp-rail.is-flash::after { animation: none !important; opacity: 1 !important; }
+
+  /* Status pill: state colours stay, breathing and sweeping stop. */
+  .animate-breathe { animation: none !important; opacity: 0.60 !important; }
+  .animate-mark    { animation: none !important; opacity: 0.80 !important; }
+  .status-sweep::after {
+    animation: none !important;
+    width: 100% !important;
+    opacity: 0.40 !important;
+    transform: none !important;
+  }
+
+  /* Transcript: rows appear, no fade, no slide. Spine sits at its decayed value. */
+  .animate-row-in   { animation: none !important; }
+  .animate-latest-in{ animation: none !important; }
+  .spine-flash      { animation: none !important; opacity: 0.55 !important; }
+
+  /* Objection chip: the cooldown bar is state, so hold it solid for the full 2000ms
+     and then remove it in JS. No scale on press, background step instead. */
+  .chip-drain {
+    animation: none !important;
+    transform: scaleX(1) !important;
+  }
+  .chip-press:active { transform: none !important; background: var(--surface-2) !important; }
+
+  /* Copy confirmation is information. Keep it, opacity only. */
+  .copy-ack { animation: copy-ack 1020ms linear 1 forwards !important; animation-duration: 1020ms !important; }
+}
