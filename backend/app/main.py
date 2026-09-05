@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.routes_context import router as context_router
+from app.api.routes_practice import router as practice_router
 from app.api.routes_ws import router as ws_router
 from app.config import cors_origin_list, settings
 from app.services.groq_client import GroqClient
@@ -164,6 +165,7 @@ app.add_middleware(
 )
 
 app.include_router(context_router)
+app.include_router(practice_router)
 app.include_router(ws_router)
 
 

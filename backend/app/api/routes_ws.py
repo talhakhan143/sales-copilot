@@ -15,6 +15,11 @@ Everything an operator would call a "stall" is designed against here: audio
 ingest never waits on the network (a bounded queue plus one worker does the
 slow work), a new suggestion cancels the in flight one (barge in), and every
 per message handler is wrapped so a single bad frame can never kill the socket.
+
+The same socket also serves practice mode, chosen by ``session.mode``. There the
+prospect is not on the line at all: the server writes the client's lines with a
+persona model, the browser speaks them out loud, and the REP stream is what
+drives the call forward. The live path above is untouched by that branch.
 """
 
 from __future__ import annotations
@@ -24,14 +29,18 @@ import contextlib
 import json
 import logging
 import time
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
+from app import practice
 from app.config import Settings, settings
 from app.prompts import QUICK_ACTIONS, quick_action_prompt
+from app.services import practice_engine
 from app.services.audio import SAMPLE_RATE, VadConfig, VadSegmenter, wav_bytes
 from app.services.groq_client import GroqClient, GroqError
+from app.services.scoring import PracticeTurn
 from app.services.session_store import Session, store
 
 log = logging.getLogger("salescopilot.api.ws")
@@ -83,9 +92,42 @@ _ID_COUNTERS: dict[str, int] = {}
 #: Hard cap so a long lived server cannot accumulate counters forever.
 _ID_COUNTER_CAP = 1024
 
+#: Fallback practice level when the session carries none.
+DEFAULT_DIFFICULTY = "normal"
+
+#: Fallback turn limit when the difficulty entry carries none. It counts client
+#: lines only, the same way ``app.practice`` writes it and the same way the
+#: persona prompt states it, so this is fourteen lines from the client.
+DEFAULT_TURN_LIMIT = 14
+
 _QUICK_ACTION_BY_KEY: dict[str, dict[str, Any]] = {
     str(action["key"]): dict(action) for action in QUICK_ACTIONS
 }
+
+_DIFFICULTY_BY_KEY: dict[str, dict[str, Any]] = {
+    str(entry.get("key", "")): dict(entry) for entry in practice.DIFFICULTIES
+}
+
+#: Mood of the hardcoded opening line, so the very first client turn already
+#: sounds like the level the rep picked. No model call is made for the opener.
+_OPENING_MOOD: dict[str, str] = {"warm": "warm", "normal": "neutral", "brutal": "cold"}
+
+#: What the rep reads when the practice call ends. Plain, short, no jargon.
+_PRACTICE_OVER_MESSAGES: dict[str, str] = {
+    "hangup": "The client hung up on you.",
+    "rep_ended": "You ended the practice call.",
+    "goal_reached": "The client said yes. Good work.",
+    "turn_limit": "That is the end of this practice call.",
+}
+
+_PRACTICE_OVER_DEFAULT = "The practice call is over."
+
+_PRACTICE_CLIENT_AUDIO_NOTICE = (
+    "This is a practice call, so the client voice is made here. Shared tab audio "
+    "is not used. Only your microphone is needed."
+)
+
+_NOT_PRACTICE_MESSAGE = "This is a real call, so practice mode is off for it."
 
 _NO_KEY_MESSAGE = (
     "GROQ_API_KEY is not set. Put a free key from https://console.groq.com/keys "
@@ -141,6 +183,69 @@ def _new_segmenter(cfg_settings: Settings) -> VadSegmenter:
     )
 
 
+def _client_reply_fields(reply: object) -> tuple[str, str, str, str]:
+    """Normalise a persona reply into the four fields the wire carries.
+
+    ``practice_engine`` owns the persona call and may hand back a dataclass or
+    a plain dict, and the model behind it can always drop a key, so every field
+    is read defensively and falls back to a neutral value. A reply with no
+    ``say`` is treated as no reply at all by the caller.
+
+    Args:
+        reply: Whatever ``practice_engine.next_client_turn`` returned.
+
+    Returns:
+        A tuple of ``(say, mood, intent, objection)``, each already stripped.
+    """
+
+    def pick(*names: str, default: str) -> str:
+        for name in names:
+            if isinstance(reply, Mapping):
+                if name not in reply:
+                    continue
+                value: object = reply[name]
+            else:
+                value = getattr(reply, name, None)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return default
+
+    return (
+        pick("say", "text", default=""),
+        pick("mood", default="neutral"),
+        pick("intent", default="question"),
+        pick("objection", default="none"),
+    )
+
+
+def _plain_groq_error(exc: GroqError, prefix: str) -> str:
+    """Turn a raw Groq failure into one plain sentence the rep can act on.
+
+    The rep is mid call. A stack of provider jargon helps nobody, and the two
+    failures that actually happen on a free key have a clear, short answer.
+
+    Args:
+        exc: The error the client raised.
+        prefix: What was being attempted, as a full sentence.
+
+    Returns:
+        A short message in plain English.
+    """
+    status = getattr(exc, "status", 0)
+    if status == 429:
+        return f"{prefix} You have hit the free Groq limit. Wait a minute, then try again."
+    if status in (401, 403):
+        return f"{prefix} The Groq key was refused. Check GROQ_API_KEY in backend/.env."
+    if status == 404:
+        return f"{prefix} That model is gone. Check LLM_MODEL in backend/.env."
+    if status >= 500 or status == 0:
+        return f"{prefix} Groq did not answer. Try again in a moment."
+    return f"{prefix} {exc}"
+
+
 class TeleprompterConnection:
     """One live socket: two VAD streams, one STT worker, one LLM task.
 
@@ -191,6 +296,17 @@ class TeleprompterConnection:
         self._last_no_key_notice = 0.0
         self._overruns = 0
         self._id_counter = _ID_COUNTERS.get(session.id, 0)
+
+        # Practice mode state. All of it is inert on a live call.
+        self._practice_started = False
+        self._practice_over = False
+        # True while the browser is speaking the client line through the
+        # speakers. See _practice_accepts_audio, this is the half duplex flag.
+        self._client_voice_playing = False
+        self._client_audio_noticed = False
+        # The suggestion the rep can actually read right now. Recorded with the
+        # next rep turn so the debrief can measure how much the prompter helped.
+        self._suggestion_on_screen = ""
 
     # ================================================================== #
     # lifecycle
@@ -306,6 +422,9 @@ class TeleprompterConnection:
         chunk holding more audio than ``max_utterance_ms`` drives the VAD force
         split into re emitting a multi megabyte utterance on every push.
 
+        In practice mode a frame can also be dropped on purpose, see
+        :meth:`_practice_accepts_audio`.
+
         Args:
             data: The raw binary frame, stream byte followed by Int16 LE PCM.
         """
@@ -333,6 +452,9 @@ class TeleprompterConnection:
                         "message": f"Unknown stream id {data[0]}, expected 0 or 1.",
                     }
                 )
+                return
+
+            if self._practice and not await self._practice_accepts_audio(stream):
                 return
 
             pcm = data[1:]
@@ -412,6 +534,12 @@ class TeleprompterConnection:
                 await self._handle_manual_text(message)
             elif kind == "config":
                 await self._handle_config(message)
+            elif kind == "practice_start":
+                await self._handle_practice_start()
+            elif kind == "practice_end":
+                await self._handle_practice_end()
+            elif kind == "speech_state":
+                await self._handle_speech_state(message)
             else:
                 await self._send(
                     {
@@ -514,7 +642,9 @@ class TeleprompterConnection:
         """Inject a typed transcript line, the fallback when audio is not usable.
 
         A client line behaves exactly like a spoken one, so it also respects
-        the autoSuggest flag.
+        the autoSuggest flag. In practice mode a typed line behaves like a
+        spoken one too, which is what lets the whole practice call be driven
+        from the keyboard when there is no working microphone.
 
         The line is clamped to :data:`MAX_MANUAL_TEXT_CHARS`. It is retained in
         the session for the whole TTL and replayed into every later suggestion
@@ -542,6 +672,13 @@ class TeleprompterConnection:
                 "final": True,
             }
         )
+
+        if self._practice:
+            if stream == "rep":
+                await self._practice_rep_turn(text, 0)
+            else:
+                await self._status("idle")
+            return
 
         if stream != "client" or not self._auto_suggest:
             await self._status("idle")
@@ -697,6 +834,15 @@ class TeleprompterConnection:
             return
 
         self._session.append(name, text)
+
+        # Practice mode inverts the live rule below: there is no prospect on
+        # the line, so it is the REP utterance that moves the call forward.
+        if self._practice:
+            if name == "rep":
+                await self._practice_rep_turn(text, stt_ms)
+            else:
+                await self._status("idle")
+            return
 
         # The rep stream is context only. It never triggers a suggestion,
         # otherwise the copilot would answer the rep's own voice.
@@ -905,6 +1051,410 @@ class TeleprompterConnection:
                 await self._send({"type": "status", "state": "idle"})
             if text and not cancelled:
                 self._session.append("copilot", text)
+                # This line is now the one on the teleprompter, so it is what
+                # the rep could read next. The next practice rep turn is stored
+                # with it, which is how the debrief measures the prompter.
+                self._suggestion_on_screen = text
+
+    # ================================================================== #
+    # practice mode
+    # ================================================================== #
+
+    @property
+    def _practice(self) -> bool:
+        """Report whether this session is a practice call.
+
+        Returns:
+            True only when the session was marked by ``POST /api/practice/start``.
+            The attribute is read with a default so a live session created
+            before practice mode existed still works.
+        """
+        return str(getattr(self._session, "mode", "live")) == "practice"
+
+    def _difficulty(self) -> str:
+        """Return the level this practice call was started at.
+
+        Returns:
+            The difficulty key, falling back to the middle level.
+        """
+        return str(getattr(self._session, "difficulty", "") or DEFAULT_DIFFICULTY)
+
+    def _turn_limit(self) -> int:
+        """Return how many client turns this level allows before it ends.
+
+        ``app.practice`` writes this number in client turns only, and the
+        persona prompt is built from that same number, so the socket has to
+        count the same way. Counting both sides would cut every practice call
+        at half the length the client was briefed for.
+
+        Returns:
+            The turn limit from the difficulty table, never below two.
+        """
+        entry = _DIFFICULTY_BY_KEY.get(self._difficulty(), {})
+        try:
+            limit = int(entry.get("turn_limit", DEFAULT_TURN_LIMIT))
+        except (TypeError, ValueError):
+            limit = DEFAULT_TURN_LIMIT
+        return max(2, limit)
+
+    def _practice_turns(self) -> list[PracticeTurn]:
+        """Return the practice transcript, creating it when it is missing.
+
+        Returns:
+            The live list held on the session, so appending to it is enough.
+        """
+        turns = getattr(self._session, "practice_turns", None)
+        if turns is None:
+            turns = []
+            self._session.practice_turns = turns
+        return turns
+
+    def _client_turn_count(self) -> int:
+        """Count how many lines the fake client has said in this call.
+
+        Returns:
+            The number of recorded client turns. This is what the turn limit
+            is measured against, never the rep turns.
+        """
+        return sum(1 for turn in self._practice_turns() if turn.role == "client")
+
+    async def _practice_accepts_audio(self, stream: StreamName) -> bool:
+        """Decide whether one practice audio frame may reach the VAD.
+
+        This is deliberate half duplex. While the browser is speaking the
+        client line through the speakers, the microphone hears those speakers,
+        so the frames are dropped here at the door and never touch the
+        segmenter. If they were fed in, the VAD would close an utterance made
+        of the fake client's own voice, Whisper would transcribe it, and the
+        persona would end up answering itself. The rep can cut in at any time,
+        the browser stops speaking, clears the flag, and the mic is live again.
+
+        Args:
+            stream: Which stream the frame arrived on.
+
+        Returns:
+            True when the frame should be segmented as normal.
+        """
+        if stream == "client":
+            # There is no prospect on the line in practice mode, the client
+            # voice is written here and spoken by the browser, so shared tab
+            # audio has nothing to carry. Say so once, then stay quiet.
+            if not self._client_audio_noticed:
+                self._client_audio_noticed = True
+                await self._send(
+                    {
+                        "type": "error",
+                        "code": "practice_client_audio",
+                        "message": _PRACTICE_CLIENT_AUDIO_NOTICE,
+                    }
+                )
+            return False
+        if self._client_voice_playing:
+            return False
+        # Before the first practice_start, and after practice_over, the mic is
+        # simply not part of anything.
+        return self._practice_started and not self._practice_over
+
+    async def _handle_practice_start(self) -> None:
+        """Start a practice call. The fake client speaks first.
+
+        The opening line is hardcoded per level in ``app.practice``, so the
+        call opens with zero latency and zero tokens. It is recorded as a real
+        practice turn and it also feeds the copilot, so by the time the rep has
+        heard it the teleprompter already holds their answer.
+        """
+        if not self._practice:
+            await self._send(
+                {"type": "error", "code": "not_practice", "message": _NOT_PRACTICE_MESSAGE}
+            )
+            return
+
+        session = self._session
+        self._practice_started = True
+        self._practice_over = False
+        self._client_voice_playing = False
+        self._suggestion_on_screen = ""
+
+        # A fresh run, so the previous one is cleared out of both transcripts.
+        # The copilot must not see the last call, and the scorecard must not
+        # count it.
+        self._practice_turns().clear()
+        session.turns.clear()
+        session.started_at = time.time()
+        session.ended_at = 0.0
+        session.ended_reason = None
+
+        names: tuple[StreamName, StreamName] = ("client", "rep")
+        for name in names:
+            self._segmenters[name].reset()
+            self._last_speaking[name] = False
+
+        await self._send_practice_state()
+
+        difficulty = self._difficulty()
+        text = str(
+            practice.opening_line(difficulty, getattr(session, "persona_name", None))
+        ).strip()
+        if not text:
+            await self._send(
+                {
+                    "type": "error",
+                    "code": "internal",
+                    "message": "The practice client had no opening line.",
+                }
+            )
+            return
+
+        await self._client_turn(
+            text,
+            mood=_OPENING_MOOD.get(difficulty, "neutral"),
+            intent="question",
+            objection="none",
+            ms=0,
+        )
+        log.info("practice call started on session %s at level %s", session.id, difficulty)
+
+        if self._groq.configured:
+            await self._start_llm(self._build_messages(), "speech", text, 0)
+        else:
+            await self._notify_missing_key()
+
+    async def _handle_practice_end(self) -> None:
+        """Stop the practice call because the rep asked for their score."""
+        if not self._practice:
+            await self._send(
+                {"type": "error", "code": "not_practice", "message": _NOT_PRACTICE_MESSAGE}
+            )
+            return
+        await self._end_practice("rep_ended")
+
+    async def _handle_speech_state(self, message: dict[str, Any]) -> None:
+        """Track whether the browser is speaking the client line out loud.
+
+        The segmenter is reset on both edges. Going into speech it may hold a
+        half open utterance that would otherwise be glued to whatever the rep
+        says afterwards, and coming out of speech its noise floor was measured
+        against the speakers, so both sides start clean.
+
+        Args:
+            message: The decoded ``speech_state`` frame, carrying ``speaking``.
+        """
+        speaking = bool(message.get("speaking", False))
+        if speaking == self._client_voice_playing:
+            return
+        self._client_voice_playing = speaking
+        self._segmenters["rep"].reset()
+        self._last_speaking["rep"] = False
+        await self._emit_vad("rep", False, 0.0, force=True)
+
+    async def _practice_rep_turn(self, text: str, stt_ms: int) -> None:
+        """Answer one rep utterance as the client, then prompt the rep again.
+
+        The order matters. The rep turn is recorded first, with the suggestion
+        that was on screen while they spoke, because that pair is what the
+        scorecard uses to say whether the prompter helped. Then the persona
+        writes the client's reply, it is emitted and recorded, and only if the
+        call is still alive does the copilot answer that reply, exactly as it
+        answers a real prospect on a live call.
+
+        Args:
+            text: What the rep just said.
+            stt_ms: Measured STT latency, ``0`` for a typed line.
+        """
+        if not self._practice_started or self._practice_over:
+            await self._status("idle")
+            return
+
+        self._record_practice_turn("rep", text, suggestion=self._suggestion_on_screen)
+
+        if not self._groq.configured:
+            await self._notify_missing_key()
+            await self._status("idle")
+            return
+
+        await self._send({"type": "status", "state": "thinking"})
+        started = time.perf_counter()
+        try:
+            reply = await practice_engine.next_client_turn(
+                self._groq,
+                session=self._session,
+                rep_said=text,
+                # The caller already appended this rep line to the transcript,
+                # so the persona sees the whole thread, oldest first. Copilot
+                # turns are dropped inside the engine, the client never gets to
+                # read what the rep is being fed.
+                history=list(self._session.turns),
+            )
+        except GroqError as exc:
+            await self._send(
+                {
+                    "type": "error",
+                    "code": "persona_failed",
+                    "message": _plain_groq_error(exc, "The practice client could not answer."),
+                }
+            )
+            await self._status("idle")
+            return
+        reply_ms = int((time.perf_counter() - started) * 1000)
+
+        # The persona is awaited on the utterance worker while the receive loop
+        # keeps reading frames, so "End and score me" can land in the middle of
+        # this await. If it did, the call is already scored and this reply must
+        # not be spoken, recorded, or answered by the copilot.
+        if self._practice_over or not self._practice_started:
+            await self._status("idle")
+            return
+
+        say, mood, intent, objection = _client_reply_fields(reply)
+        if not say:
+            await self._send(
+                {
+                    "type": "error",
+                    "code": "persona_empty",
+                    "message": "The practice client said nothing. Say your line again.",
+                }
+            )
+            await self._status("idle")
+            return
+
+        await self._client_turn(say, mood=mood, intent=intent, objection=objection, ms=reply_ms)
+        await self._send_practice_state()
+
+        if intent == "hangup":
+            await self._end_practice("hangup")
+            return
+        if intent == "agree":
+            # The client agreed to the next step, which is the whole point of
+            # the call, so it ends on the win instead of drifting on.
+            await self._end_practice("goal_reached")
+            return
+        if self._client_turn_count() >= self._turn_limit():
+            await self._end_practice("turn_limit")
+            return
+
+        await self._start_llm(self._build_messages(), "speech", say, stt_ms)
+
+    async def _client_turn(
+        self,
+        text: str,
+        *,
+        mood: str,
+        intent: str,
+        objection: str,
+        ms: int,
+    ) -> None:
+        """Emit one client line, record it, and put it in the copilot window.
+
+        Args:
+            text: What the client says. The browser speaks this out loud.
+            mood: ``cold``, ``neutral`` or ``warm``.
+            intent: ``question``, ``objection``, ``brushoff``, ``agree`` or
+                ``hangup``.
+            objection: The objection key, or ``none``.
+            ms: How long the persona took, ``0`` for the hardcoded opener.
+        """
+        mid = self._next_id()
+        await self._send(
+            {
+                "type": "client_turn",
+                "id": mid,
+                "text": text,
+                "mood": mood,
+                "intent": intent,
+                "objection": objection,
+                "ms": ms,
+            }
+        )
+        self._record_practice_turn(
+            "client",
+            text,
+            mood=mood,
+            intent=intent,
+            objection=objection,
+        )
+        # The copilot sees a practice client line exactly as it sees a real
+        # prospect line, which is what makes the teleprompter behave the same.
+        self._session.append("client", text)
+
+    def _record_practice_turn(
+        self,
+        role: str,
+        text: str,
+        *,
+        mood: str = "neutral",
+        intent: str = "question",
+        objection: str = "none",
+        suggestion: str = "",
+    ) -> None:
+        """Store one practice turn for the scorecard.
+
+        Args:
+            role: ``"rep"`` or ``"client"``.
+            text: What was said.
+            mood: Client mood, ignored for a rep turn.
+            intent: Client intent, ignored for a rep turn.
+            objection: Client objection key, ignored for a rep turn.
+            suggestion: The teleprompter line that was on screen, only ever set
+                for a rep turn.
+        """
+        # Touch the list first so a session made before practice mode existed
+        # still gets one, then let the store append so the practice turn cap is
+        # enforced in the one place that owns it.
+        self._practice_turns()
+        self._session.record_practice_turn(
+            PracticeTurn(
+                role=role,
+                text=text,
+                ts=time.time(),
+                mood=mood,
+                intent=intent,
+                objection=objection,
+                suggestion_shown=suggestion,
+            )
+        )
+
+    async def _send_practice_state(self) -> None:
+        """Tell the client how many turns are in and whether the call is live."""
+        await self._send(
+            {
+                "type": "practice_state",
+                "turns": len(self._practice_turns()),
+                "started": self._practice_started and not self._practice_over,
+            }
+        )
+
+    async def _end_practice(self, reason: str) -> None:
+        """Close the practice call once, and tell the client why.
+
+        After this the microphone is ignored until a new ``practice_start``.
+        The session keeps its turns so the debrief can score them.
+
+        Args:
+            reason: ``hangup``, ``rep_ended``, ``goal_reached`` or ``turn_limit``.
+        """
+        if self._practice_over:
+            return
+        self._practice_over = True
+        self._practice_started = False
+        self._client_voice_playing = False
+        self._session.ended_at = time.time()
+        self._session.ended_reason = reason
+
+        turns = len(self._practice_turns())
+        await self._send(
+            {
+                "type": "practice_over",
+                "reason": reason,
+                "turns": turns,
+                "message": _PRACTICE_OVER_MESSAGES.get(reason, _PRACTICE_OVER_DEFAULT),
+            }
+        )
+        log.info(
+            "practice call ended on session %s, reason=%s, turns=%d",
+            self._session.id,
+            reason,
+            turns,
+        )
 
     # ================================================================== #
     # outbound helpers

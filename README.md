@@ -115,6 +115,61 @@ When the prospect stops, the suggestion lands on the glass and you read it out l
 
 ---
 
+## Practice mode
+
+You do not want your first ten cold calls to be the ones where you learn. Practice mode
+puts a robot client on the other end. It talks first, it talks back out loud through your
+browser, it pushes back with real objections, and it can hang up on you. The teleprompter
+runs exactly as it does on a real call, so you are training the real skill: glance, read
+out loud, keep going.
+
+Pick "Practice call" at the top of the setup page, choose a level, and fill in the same
+boxes you would for a real call. You practise against the client you are actually about
+to phone.
+
+| Level | What they are like |
+|---|---|
+| **Warm** | Friendly. They ask real questions and give you time to talk. |
+| **Normal** | Busy and short. They push back two or three times. |
+| **Brutal** | They want to hang up. You get one line to keep them. |
+
+The client speaks through your browser's own voice, so it costs nothing and never runs out.
+Your microphone is off while they talk, and it turns back on the moment they stop. Press
+the space bar or the **Cut in** button to interrupt them, which is a real skill worth
+practising. No microphone at all? Type your line in the log instead, the robot still answers.
+
+### The scorecard
+
+When you press **End and score me** you get a score out of 100 and, more useful, exactly
+where every point came from:
+
+| Row | Out of |
+|---|---|
+| Call result, did they agree | 30 |
+| Times they said no, and whether you had an answer | 20 |
+| Talking time, aim for about half | 15 |
+| Questions asked | 10 |
+| Reply speed, how fast you started talking | 10 |
+| Prompter use, how many of its lines you actually used | 10 |
+| Filler words | 5 |
+
+Every number in there is counted in Python, never guessed by a model. Only the judgement
+calls (what went well, what to fix, the best and worst moment) come from the model, and it
+is told to quote your own words back and never invent a quote.
+
+The part most people care about is **How much the prompter helped you**: how many of its
+lines you used out of how many it gave you, plus your best moment and your worst moment
+side by side, showing what the client said, what the prompter told you to say, and what
+you actually said. That is the fastest way to find out whether you should be trusting the
+screen more or less.
+
+A practice call makes two model calls per turn instead of one, so it burns the Groq free
+tier about twice as fast as a real call. If you see "You have hit the free Groq limit",
+wait a minute.
+
+
+---
+
 ## Latency
 
 Measured on this machine against the Groq free tier, not estimated.
@@ -193,12 +248,17 @@ backend/
   app/services/context_builder.py fuses knowledge base + scrape into the system prompt
   app/api/routes_context.py      REST
   app/api/routes_ws.py           the websocket, VAD, barge in, latency accounting
+  app/practice.py                the robot client personas and the coach prompt
+  app/services/practice_engine.py the persona and coach model calls, with fallbacks
+  app/services/scoring.py        the scorecard arithmetic, pure and self testing
+  app/api/routes_practice.py     practice REST
 frontend/
   app/page.tsx                   setup
   app/call/page.tsx              the cockpit
   app/api/*/route.ts             server side proxies to FastAPI, so no CORS in the browser
   components/                    Teleprompter, ObjectionBar, WaveVisualizer, TranscriptRail, ...
   lib/audio/capture.ts           dual stream capture, worklet wiring, device handling
+  lib/practice/speech.ts         the browser voice, with the Chrome speech bugs worked around
   lib/ws/client.ts               reconnect ladder, backpressure guard, heartbeat
   lib/hooks/useTeleprompter.ts   the one hook the dashboard hangs off
   public/worklets/               the PCM recorder worklet
@@ -213,6 +273,9 @@ body `{ knowledgeBase, clientUrl?, clientContext?, callGoal?, language? }`
 -> `{ sessionId, systemPrompt, clientTitle, scrapeChars, scrapeOk, scrapeError, ... }`
 `clientContext` is the free text description used when the client has no website.
 `GET  /api/health`          -> `{ status, groqConfigured, sessions, version, models }`
+`POST /api/practice/start`  same body as prepare-context plus `difficulty`, returns the opening line
+`GET  /api/practice/difficulties`
+`GET  /api/practice/{id}/debrief` -> the scorecard
 `GET  /api/quick-actions`   -> the 8 frozen objection buttons
 `GET  /api/session/{id}`    -> `{ exists, turns, createdAt }`
 `WS   /ws/teleprompter?session_id=<uuid>`
@@ -222,7 +285,8 @@ the stream byte is `0` for the prospect and `1` for you. Text frames are JSON wi
 of `ping`, `control`, `quick_action`, `manual_text` or `config`.
 
 Server to client: `ready`, `pong`, `vad`, `transcript`, `suggestion_start`,
-`suggestion_delta`, `suggestion_done`, `status`, `error`.
+`suggestion_delta`, `suggestion_done`, `status`, `error`, and in practice mode
+`client_turn`, `practice_state` and `practice_over`.
 
 Interactive docs at http://127.0.0.1:8000/docs
 

@@ -877,6 +877,7 @@ class GroqClient:
         *,
         max_tokens: int,
         temperature: float,
+        response_format: dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         """Stream chat completion deltas from Groq as they arrive.
 
@@ -893,6 +894,11 @@ class GroqClient:
             messages: OpenAI style message list (system first, then the window).
             max_tokens: Hard ceiling on generated tokens.
             temperature: Sampling temperature.
+            response_format: Optional OpenAI style response format object, for
+                example ``{"type": "json_object"}`` when the caller needs one
+                JSON object back instead of prose. It is merged into the request
+                payload only when it is not None, because Groq answers 400 to an
+                unknown or empty parameter rather than ignoring it.
 
         Yields:
             Content deltas in order. Deltas may be partial words, append them
@@ -916,6 +922,11 @@ class GroqClient:
         # this the teleprompter either shows the chain of thought or waits
         # several hundred milliseconds for it to finish.
         payload.update(reasoning_params(self._llm_model))
+        # Structured output is opt in. The teleprompter wants spoken prose and
+        # sends nothing here, while callers that parse the answer (the practice
+        # persona and the practice coach) ask for a JSON object.
+        if response_format is not None:
+            payload["response_format"] = response_format
         sanitizer = StreamSanitizer()
         url = f"{self._base_url}/chat/completions"
 
@@ -990,6 +1001,7 @@ class GroqClient:
         *,
         max_tokens: int,
         temperature: float,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
         """Run a chat completion and return the whole answer as one string.
 
@@ -1001,6 +1013,9 @@ class GroqClient:
             messages: OpenAI style message list.
             max_tokens: Hard ceiling on generated tokens.
             temperature: Sampling temperature.
+            response_format: Optional OpenAI style response format object, for
+                example ``{"type": "json_object"}``. Passed straight through to
+                :meth:`stream_chat`, and ignored when it is None.
 
         Returns:
             The joined and stripped completion text.
@@ -1014,6 +1029,7 @@ class GroqClient:
             messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            response_format=response_format,
         ):
             parts.append(delta)
         text = "".join(parts).strip()

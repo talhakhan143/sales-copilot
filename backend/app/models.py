@@ -33,6 +33,18 @@ MAX_CALL_GOAL_CHARS: int = 600
 MAX_CLIENT_CONTEXT_CHARS: int = 6000
 """Longest free text description of the client we keep."""
 
+PRACTICE_DIFFICULTIES: frozenset[str] = frozenset({"warm", "normal", "brutal"})
+"""The three practice clients a rep can rehearse against."""
+
+DEFAULT_DIFFICULTY: str = "normal"
+"""Difficulty used when the client sends nothing, or sends something unknown."""
+
+PRACTICE_OUTCOMES: frozenset[str] = frozenset({"booked", "soft_yes", "no_answer", "hung_up"})
+"""How a practice call is allowed to end, as judged by the coach model."""
+
+DEFAULT_OUTCOME: str = "no_answer"
+"""Outcome used when the coach model answers with a word we do not know."""
+
 
 class CamelModel(BaseModel):
     """Base model that speaks camelCase on the wire and snake_case in Python.
@@ -297,12 +309,275 @@ class QuickActionsResponse(CamelModel):
         return cls(actions=[QuickActionModel(**entry) for entry in entries])
 
 
+class PracticeStartRequest(PrepareContextRequest):
+    """Body of ``POST /api/practice/start``.
+
+    The rep practises against the very client they are about to call, so this is
+    the prepare context body with one extra field. Every validator on the parent
+    still runs, so the knowledge base, the URL, the notes, the goal and the
+    language are cleaned exactly the same way here as on a real call.
+
+    Attributes:
+        difficulty: ``warm``, ``normal`` or ``brutal``. Anything else becomes
+            ``normal`` instead of a 422, because a bad difficulty must never
+            stop the rep from practising.
+    """
+
+    difficulty: str = DEFAULT_DIFFICULTY
+
+    @field_validator("difficulty", mode="before")
+    @classmethod
+    def _normalize_difficulty(cls, value: object) -> str:
+        """Lowercase the difficulty and fall back to ``normal`` when unknown.
+
+        Args:
+            value: Raw incoming difficulty value of any type.
+
+        Returns:
+            One of ``warm``, ``normal`` or ``brutal``. Never raises, for the
+            same reason the language validator never raises.
+        """
+        if not isinstance(value, str):
+            return DEFAULT_DIFFICULTY
+        key = value.strip().lower()
+        return key if key in PRACTICE_DIFFICULTIES else DEFAULT_DIFFICULTY
+
+
+class PracticeStartResponse(PrepareContextResponse):
+    """Result of starting a practice call.
+
+    Everything the real prepare context route returns, plus the four things the
+    practice UI needs to open the call page and speak the first line.
+
+    Attributes:
+        mode: Always ``"practice"``. The frontend switches its whole call page
+            on this one value.
+        difficulty: The level that was actually used, after the fallback above.
+        persona_name: Name of the person the AI client is playing, pulled out of
+            the client notes when one could be found, otherwise ``None``.
+        opening_line: The line the browser speaks before the rep says anything.
+    """
+
+    mode: str = "practice"
+    difficulty: str = DEFAULT_DIFFICULTY
+    persona_name: str | None = None
+    opening_line: str = ""
+
+
+class DifficultyModel(CamelModel):
+    """One practice level, as shown on the setup page.
+
+    Attributes:
+        key: Stable identifier sent back in ``PracticeStartRequest.difficulty``.
+        label: Short name shown on the card.
+        blurb: One plain line saying how this client behaves.
+    """
+
+    key: str
+    label: str
+    blurb: str
+
+
+class DifficultiesResponse(CamelModel):
+    """Result of ``GET /api/practice/difficulties``.
+
+    Attributes:
+        levels: The three practice levels, in display order, easiest first.
+    """
+
+    levels: list[DifficultyModel] = Field(default_factory=list)
+
+    @classmethod
+    def from_entries(cls, entries: list[dict[str, object]]) -> DifficultiesResponse:
+        """Build the response straight from the frozen list in ``app.practice``.
+
+        Only the three UI fields are copied. ``app.practice.DIFFICULTIES`` also
+        carries server side tuning like the turn limit, and none of that belongs
+        on the wire.
+
+        Args:
+            entries: Dicts carrying at least ``key``, ``label`` and ``blurb``.
+
+        Returns:
+            A populated ``DifficultiesResponse``.
+        """
+        return cls(
+            levels=[
+                DifficultyModel(
+                    key=str(entry.get("key", "")),
+                    label=str(entry.get("label", "")),
+                    blurb=str(entry.get("blurb", "")),
+                )
+                for entry in entries
+            ]
+        )
+
+
+class MetricsModel(CamelModel):
+    """The counted part of the scorecard.
+
+    Every number here is plain arithmetic over the stored practice turns. None
+    of it comes from a model, because a model cannot count.
+
+    Attributes:
+        rep_words: How many words the rep said in the whole call.
+        client_words: How many words the AI client said.
+        talking_time_pct: Rep words over total words, as a whole number.
+        questions_asked: How many rep turns contained a question mark.
+        objections_faced: How many client turns carried a real objection.
+        objections_handled: How many of those the rep got past.
+        avg_reply_ms: Average time the rep took to start talking after the
+            client stopped.
+        filler_words: How many filler words the rep used, like um and uh.
+        longest_sentence_words: Word count of the rep's longest sentence.
+    """
+
+    rep_words: int = 0
+    client_words: int = 0
+    talking_time_pct: int = 0
+    questions_asked: int = 0
+    objections_faced: int = 0
+    objections_handled: int = 0
+    avg_reply_ms: int = 0
+    filler_words: int = 0
+    longest_sentence_words: int = 0
+
+
+class CopilotMomentModel(CamelModel):
+    """One moment in the call, quoted back with all three lines.
+
+    Attributes:
+        client_said: What the AI client said.
+        copilot_said: The line the teleprompter was showing at that moment.
+        you_said: What the rep actually said next, quoted word for word.
+        why: One plain line saying why this moment matters.
+    """
+
+    client_said: str = ""
+    copilot_said: str = ""
+    you_said: str = ""
+    why: str = ""
+
+
+class CopilotReportModel(CamelModel):
+    """How much the teleprompter helped the rep.
+
+    Attributes:
+        suggestions_shown: How many lines the teleprompter put on screen.
+        suggestions_used: How many of those the rep actually used.
+        used_pct: Used over shown, as a whole number.
+        best_moment: The moment the rep used the line well, or ``None`` when
+            there was not enough of a call to pick one.
+        missed_moment: A good line the rep skipped, or ``None``.
+    """
+
+    suggestions_shown: int = 0
+    suggestions_used: int = 0
+    used_pct: int = 0
+    best_moment: CopilotMomentModel | None = None
+    missed_moment: CopilotMomentModel | None = None
+
+
+class BreakdownModel(CamelModel):
+    """One row of the score, so the rep can see where the points came from.
+
+    Attributes:
+        label: Plain name of the row, for example ``"Talking time"``.
+        got: Points won on this row.
+        out_of: Points that were on offer.
+        note: One plain line saying why, and what to do next time.
+    """
+
+    label: str
+    got: int = 0
+    out_of: int = 0
+    note: str = ""
+
+
+class FixModel(CamelModel):
+    """One thing the rep should say differently next time.
+
+    Attributes:
+        you_said: The rep's own words, quoted, never invented.
+        problem: One plain line saying what went wrong with it.
+        say_instead: The better line, ready to read out loud.
+    """
+
+    you_said: str = ""
+    problem: str = ""
+    say_instead: str = ""
+
+
+class DebriefResponse(CamelModel):
+    """Result of ``GET /api/practice/{session_id}/debrief``, the scorecard.
+
+    A rep who ended the call before saying anything still gets a valid body:
+    ``turns`` is 0, the lists are empty and both moments are ``None``, so the
+    overlay can render a thin debrief without any special casing.
+
+    Attributes:
+        session_id: The practice session this scorecard belongs to.
+        difficulty: The level that was played.
+        duration_ms: How long the call ran, in milliseconds.
+        turns: How many turns the call had, both sides counted.
+        outcome: ``booked``, ``soft_yes``, ``no_answer`` or ``hung_up``.
+        score: 0 to 100, computed in Python from the fixed rubric.
+        grade: The word next to the score, for example ``"Getting there"``.
+        summary: One plain line about the whole call.
+        metrics: The counted numbers.
+        copilot: How much the teleprompter helped.
+        breakdown: The seven rubric rows, in rubric order.
+        wins: Two or three things the rep did well, each quoting the rep.
+        fixes: Two or three things to say differently next time.
+        next_drill: One line saying what to practise on the next call.
+    """
+
+    session_id: str
+    difficulty: str = DEFAULT_DIFFICULTY
+    duration_ms: int = 0
+    turns: int = 0
+    outcome: str = DEFAULT_OUTCOME
+    score: int = 0
+    grade: str = ""
+    summary: str = ""
+    metrics: MetricsModel = Field(default_factory=lambda: MetricsModel())
+    copilot: CopilotReportModel = Field(default_factory=lambda: CopilotReportModel())
+    breakdown: list[BreakdownModel] = Field(default_factory=list)
+    wins: list[str] = Field(default_factory=list)
+    fixes: list[FixModel] = Field(default_factory=list)
+    next_drill: str = ""
+
+    @field_validator("outcome", mode="before")
+    @classmethod
+    def _normalize_outcome(cls, value: object) -> str:
+        """Lowercase the outcome and fall back to ``no_answer`` when unknown.
+
+        The coach model picks this word, so it is the one field on the scorecard
+        that a model can get wrong. A wrong word must not turn the whole debrief
+        into a 500, it just becomes the neutral outcome.
+
+        Args:
+            value: Raw outcome value of any type.
+
+        Returns:
+            One of the four allowed outcome words.
+        """
+        if not isinstance(value, str):
+            return DEFAULT_OUTCOME
+        key = value.strip().lower()
+        return key if key in PRACTICE_OUTCOMES else DEFAULT_OUTCOME
+
+
 __all__ = [
     "SUPPORTED_LANGUAGES",
     "DEFAULT_LANGUAGE",
     "MAX_CLIENT_URL_CHARS",
     "MAX_CALL_GOAL_CHARS",
     "MAX_CLIENT_CONTEXT_CHARS",
+    "PRACTICE_DIFFICULTIES",
+    "DEFAULT_DIFFICULTY",
+    "PRACTICE_OUTCOMES",
+    "DEFAULT_OUTCOME",
     "CamelModel",
     "PrepareContextRequest",
     "PrepareContextResponse",
@@ -310,4 +585,14 @@ __all__ = [
     "HealthResponse",
     "QuickActionModel",
     "QuickActionsResponse",
+    "PracticeStartRequest",
+    "PracticeStartResponse",
+    "DifficultyModel",
+    "DifficultiesResponse",
+    "MetricsModel",
+    "CopilotMomentModel",
+    "CopilotReportModel",
+    "BreakdownModel",
+    "FixModel",
+    "DebriefResponse",
 ]

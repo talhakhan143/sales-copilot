@@ -20,9 +20,28 @@
  *   sensitivity    number               current VAD multiplier, 0.5 to 3.0
  *   trigger        SuggestionTrigger|null   what caused the shown suggestion
  *   sourceText     string | null        the prospect line that caused it
+ *   practice       PracticeApi          rehearsal state and its three actions
+ *   startPractice  () => void           the same three actions, also at the top
+ *   endPractice    () => void           level, so a call site can destructure
+ *   cutIn          () => void           either way
  *
  * Nothing in 4.4 was renamed or removed, so any component written against the
  * contract keeps working.
+ *
+ * PRACTICE MODE (CONTRACT_PRACTICE.md sections 3 and 6.1)
+ *
+ * The second argument turns the rehearsal on. It is off unless the caller asks
+ * for it, and with it off this hook does exactly what it did before: a live
+ * call never receives a client_turn frame, so nothing below can fire.
+ *
+ * A practice call is half duplex on purpose. When a client_turn arrives the
+ * browser says the line out loud, and while it is talking the rep's microphone
+ * frames are held back so the synthetic client is not transcribed as the rep.
+ * The gate is a ref, not state, because it is read inside the capture callback
+ * about thirty times a second and a state value read there would be the one
+ * captured when the stream started, which is always false. cutIn() cuts the
+ * speech off mid word and hands the microphone straight back, because talking
+ * over a prospect is a real cold call skill.
  *
  * Performance rules held here, in order of how badly they bite:
  *   1. Tokens never call setState directly. suggestion_delta appends to a ref
@@ -39,6 +58,8 @@
  *   4. Everything returned that is a function is a stable useCallback, so a
  *      memoised child such as the objection bar gets identical props on a
  *      token and bails out of its own render.
+ *   5. The practice clock is one interval, not one per component. It is cleared
+ *      when the call ends and when the hook unmounts.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -46,10 +67,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CaptureError, listInputDevices, startCapture } from "@/lib/audio/capture";
 import type { CaptureHandle } from "@/lib/audio/capture";
 import { teleprompterWsUrl } from "@/lib/config";
+import { cancelSpeech, primeSpeech, rateForDifficulty, speak } from "@/lib/practice/speech";
 import { TeleprompterSocket } from "@/lib/ws/client";
 import type {
   CallStatus,
   ConnState,
+  Difficulty,
+  PracticeOverReason,
   QuickAction,
   ServerMessage,
   StreamKind,
@@ -77,6 +101,52 @@ export interface LatencySnapshot {
   rtt: number | null;
 }
 
+/**
+ * How the caller asks for a rehearsal instead of a live call.
+ *
+ * Every field is optional and the whole object is optional, so an existing call
+ * site that passes only a session id keeps the live behaviour it has today.
+ */
+export interface TeleprompterOptions {
+  /** True when this session is a rehearsal against the synthetic client. */
+  practice?: boolean;
+  /** How hard the synthetic client is. It sets how fast the voice talks. */
+  difficulty?: Difficulty;
+  /**
+   * Which language the client is spoken in, for example "en" or "ur". Pass the
+   * language the session was prepared with. Defaults to English.
+   */
+  language?: string;
+}
+
+/** Everything the practice strip and the score card overlay need. */
+export interface PracticeApi {
+  /** True when this session is a rehearsal. False on a real call. */
+  active: boolean;
+  /** True once the rep has pressed start and the client has been asked to talk. */
+  started: boolean;
+  /** True once the call is finished, whoever finished it. */
+  over: boolean;
+  /** Why it finished, or null while it is still running. */
+  reason: PracticeOverReason | null;
+  /** How many turns the server has counted so far. */
+  turns: number;
+  /** The level this call was set up with. */
+  difficulty: Difficulty;
+  /** True while the browser is saying the client's line out loud. */
+  clientSpeaking: boolean;
+  /** The last line the client said, or null before the first one. */
+  clientLine: string | null;
+  /** Milliseconds since the rep pressed start. Frozen when the call ends. */
+  elapsedMs: number;
+  /** Prime the voice engine and ask the client to speak first. */
+  startPractice(): void;
+  /** Stop the call and ask the server for a score. */
+  endPractice(): void;
+  /** Cut the client off mid word and take the microphone back. */
+  cutIn(): void;
+}
+
 export interface TeleprompterApi {
   status: CallStatus;
   suggestion: string;
@@ -96,6 +166,7 @@ export interface TeleprompterApi {
   sensitivity: number;
   busy: StreamKind | null;
   error: string | null;
+  practice: PracticeApi;
   startClient(source: ClientSource): Promise<void>;
   startRep(deviceId?: string): Promise<void>;
   stopStream(kind: StreamKind): void;
@@ -105,6 +176,14 @@ export interface TeleprompterApi {
   setSensitivity(v: number): void;
   refreshDevices(): void;
   reset(): void;
+  /**
+   * The three practice actions are the same function objects that sit on
+   * `practice`. They are here as well so a component can take them straight off
+   * the hook, next to quickAction and reset, without unpacking practice first.
+   */
+  startPractice(): void;
+  endPractice(): void;
+  cutIn(): void;
 }
 
 /** Newest rows win. Sixty is about ten minutes of a real call. */
@@ -112,6 +191,18 @@ const MAX_TRANSCRIPT = 60;
 
 /** How often we copy the socket drop counter into React state. */
 const DROP_POLL_MS = 1000;
+
+/**
+ * How often the practice clock updates.
+ *
+ * The strip shows whole seconds, and a one second interval drifts just enough
+ * to skip a second now and then, which looks like a broken clock. Twice a
+ * second is two renders a second, which is nothing next to a token stream.
+ */
+const PRACTICE_TICK_MS = 500;
+
+/** The level used when the caller did not name one. */
+const DEFAULT_DIFFICULTY: Difficulty = "normal";
 
 const MIN_SENSITIVITY = 0.5;
 const MAX_SENSITIVITY = 3;
@@ -175,7 +266,17 @@ function withFlag(prev: StreamFlags, kind: StreamKind, value: boolean): StreamFl
   return kind === "client" ? { ...prev, client: value } : { ...prev, rep: value };
 }
 
-export function useTeleprompter(sessionId: string | null): TeleprompterApi {
+export function useTeleprompter(
+  sessionId: string | null,
+  options?: TeleprompterOptions,
+): TeleprompterApi {
+  // Read as plain values, never as an object, because the caller almost
+  // certainly passes a fresh object literal on every render and any dependency
+  // array holding it would rerun on every render.
+  const practiceEnabled = options?.practice === true;
+  const difficulty: Difficulty = options?.difficulty ?? DEFAULT_DIFFICULTY;
+  const speechLanguage = options?.language ?? "en";
+
   const [status, setStatus] = useState<CallStatus>(sessionId ? "connecting" : "closed");
   const [connState, setConnState] = useState<ConnState>("idle");
   const [suggestion, setSuggestion] = useState<string>("");
@@ -199,6 +300,16 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
   const [sensitivity, setSensitivityValue] = useState<number>(1);
   const [busy, setBusy] = useState<StreamKind | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  /* ---------------- practice mode state ---------------- */
+
+  const [practiceStarted, setPracticeStarted] = useState<boolean>(false);
+  const [practiceOver, setPracticeOver] = useState<boolean>(false);
+  const [practiceReason, setPracticeReason] = useState<PracticeOverReason | null>(null);
+  const [practiceTurns, setPracticeTurns] = useState<number>(0);
+  const [clientSpeaking, setClientSpeaking] = useState<boolean>(false);
+  const [clientLine, setClientLine] = useState<string | null>(null);
+  const [elapsedMs, setElapsedMs] = useState<number>(0);
 
   /* ---------------------------------------------------------------- */
   /* refs: everything that must not trigger a render                   */
@@ -244,6 +355,38 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
   const busyRef = useRef<StreamKind | null>(null);
   const sensitivityRef = useRef<number>(1);
   const capturesRef = useRef<StreamFlags>({ client: false, rep: false });
+
+  /**
+   * The half duplex gate. True means the browser is talking, so nothing the
+   * microphone hears may be sent.
+   *
+   * It has to be a ref. The capture callback below is created once, when the
+   * stream starts, and a state value read inside it would be frozen at whatever
+   * it was on that render, which is always false. On a live call this never
+   * turns true, because only a client_turn frame can close it, so the audio path
+   * behaves exactly as it did before practice mode existed.
+   */
+  const micGateRef = useRef<boolean>(false);
+
+  /**
+   * One counter per spoken line, so a callback from a line that was already
+   * cancelled cannot open the gate under the line that replaced it.
+   *
+   * speak() cancels whatever is speaking first, and that cancel fires the old
+   * line's onEnd synchronously. Without this check that stale onEnd would send
+   * "not speaking" a moment after we sent "speaking" for the new line, and the
+   * microphone would stay live while the client talked over it.
+   */
+  const speechSeqRef = useRef<number>(0);
+
+  /** Voice settings, held in a ref so the speak helper stays a stable callback. */
+  const speechSettingsRef = useRef<{ lang: string; rate: number }>({
+    lang: "en",
+    rate: rateForDifficulty(DEFAULT_DIFFICULTY),
+  });
+
+  /** When the rep pressed start, in epoch milliseconds. Null before that. */
+  const practiceStartedAtRef = useRef<number | null>(null);
 
   /* ---------------------------------------------------------------- */
   /* frame batched flushes                                             */
@@ -310,6 +453,84 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
   }, []);
 
   /* ---------------------------------------------------------------- */
+  /* practice: the voice and the half duplex gate                      */
+  /* ---------------------------------------------------------------- */
+
+  // The two settings the voice needs are copied into a ref so the speak helper
+  // below can stay a stable callback. They change at most once per session.
+  useEffect(() => {
+    speechSettingsRef.current = {
+      lang: speechLanguage,
+      rate: rateForDifficulty(difficulty),
+    };
+  }, [speechLanguage, difficulty]);
+
+  /**
+   * Shut the microphone gate and tell the server we are talking.
+   *
+   * The server ignores rep audio while this is true, and we stop sending it as
+   * well, so the client's own voice can never be transcribed as the rep.
+   */
+  const closeMicGate = useCallback(() => {
+    if (micGateRef.current) return;
+    micGateRef.current = true;
+    setClientSpeaking(true);
+    socketRef.current?.send({ type: "speech_state", speaking: true });
+  }, []);
+
+  /** Open the gate again. Safe to call twice, the second call does nothing. */
+  const openMicGate = useCallback(() => {
+    if (!micGateRef.current) {
+      // The ref is also cleared straight out by the socket teardown, so the
+      // "client is talking" lamp is put out here as well in case the two ever
+      // disagree. React drops this when the value is already false.
+      setClientSpeaking(false);
+      return;
+    }
+    micGateRef.current = false;
+    setClientSpeaking(false);
+    socketRef.current?.send({ type: "speech_state", speaking: false });
+  }, []);
+
+  /**
+   * Say one client line out loud and hold the microphone while it plays.
+   *
+   * The gate is shut before the line is handed to the engine, not from the
+   * engine's own start event, because muting a moment early costs nothing and
+   * muting late lets the speakers into the microphone.
+   */
+  const speakClientLine = useCallback(
+    (text: string) => {
+      const seq = speechSeqRef.current + 1;
+      speechSeqRef.current = seq;
+
+      const settings = speechSettingsRef.current;
+      closeMicGate();
+
+      speak({
+        text,
+        lang: settings.lang,
+        rate: settings.rate,
+        onStart: () => {
+          if (speechSeqRef.current !== seq) return;
+          closeMicGate();
+        },
+        onEnd: () => {
+          if (speechSeqRef.current !== seq) return;
+          openMicGate();
+        },
+        onError: (message: string) => {
+          if (speechSeqRef.current === seq) openMicGate();
+          // The line is still on the glass and in the rail, so the rehearsal
+          // carries on without a voice instead of stopping.
+          setError(message);
+        },
+      });
+    },
+    [closeMicGate, openMicGate],
+  );
+
+  /* ---------------------------------------------------------------- */
   /* socket callbacks (ref driven, never stale)                        */
   /* ---------------------------------------------------------------- */
 
@@ -332,6 +553,12 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
             }
             if (capturesRef.current.rep) {
               socket.send({ type: "control", action: "start", stream: "rep" });
+            }
+            // A reconnect that lands while the browser is still saying a client
+            // line out loud must not leave the new server side connection
+            // thinking the microphone is live.
+            if (micGateRef.current) {
+              socket.send({ type: "speech_state", speaking: true });
             }
           }
           break;
@@ -471,11 +698,69 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
           break;
         }
 
+        case "client_turn": {
+          // The synthetic client just said something. It goes on the glass, into
+          // the rail as a normal prospect row, and out of the speakers. The row
+          // id matches the one a real transcript frame would use, so if the
+          // server also logs it the two collapse into one row instead of two.
+          setClientLine(msg.text);
+          if (msg.text.trim().length > 0) {
+            pushTranscript({
+              id: `client:${msg.id}`,
+              role: "client",
+              text: msg.text,
+              ts: Date.now(),
+              ms: msg.ms,
+            });
+          }
+          speakClientLine(msg.text);
+          break;
+        }
+
+        case "practice_over": {
+          setPracticeOver(true);
+          setPracticeReason(msg.reason);
+          setPracticeTurns(msg.turns);
+          // The microphone comes back to the rep, but a line that is still
+          // playing is left alone. A hangup arrives as the client's line first
+          // and this frame a few milliseconds later, and the rep has to hear
+          // the client hang up on them. That line opens the gate itself when it
+          // finishes, so nothing stays shut.
+          if (!micGateRef.current) openMicGate();
+          // Freeze the clock on the last real reading. The interval is about to
+          // stop, so without this the strip would keep the value from up to half
+          // a second ago.
+          const startedAt = practiceStartedAtRef.current;
+          if (startedAt !== null) setElapsedMs(Date.now() - startedAt);
+          break;
+        }
+
+        case "practice_state": {
+          setPracticeTurns(msg.turns);
+          if (msg.started) {
+            if (practiceStartedAtRef.current === null) {
+              practiceStartedAtRef.current = Date.now();
+            }
+            setPracticeStarted(true);
+          }
+          // A started:false frame is the server saying it is waiting for the rep
+          // to press start. It never cancels a call that is already running,
+          // that is what practice_over is for.
+          break;
+        }
+
         default:
           break;
       }
     },
-    [cancelTextFrame, pushTranscript, scheduleTextFlush, scheduleVadFlush],
+    [
+      cancelTextFrame,
+      openMicGate,
+      pushTranscript,
+      scheduleTextFlush,
+      scheduleVadFlush,
+      speakClientLine,
+    ],
   );
 
   const handleConnState = useCallback((next: ConnState) => {
@@ -555,11 +840,30 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
       pendingLevelsRef.current = { client: 0, rep: 0 };
       pendingSpeakingRef.current = { client: false, rep: false };
 
+      // A page that has gone away must not keep talking. The counter bump makes
+      // the cancelled line's own callback a no op, so it cannot try to send a
+      // speech_state on the socket we just closed.
+      speechSeqRef.current += 1;
+      cancelSpeech();
+      micGateRef.current = false;
+      practiceStartedAtRef.current = null;
+
       setCaptures({ client: false, rep: false });
       setMuted({ client: false, rep: false });
       setLevels({ client: 0, rep: 0 });
       setSpeaking({ client: false, rep: false });
       setStreaming(false);
+      setClientSpeaking(false);
+
+      // A new session id is a new rehearsal. Without this, the "Practise again"
+      // button would land on a page that still says the last call is over and
+      // would open its score card again.
+      setPracticeStarted(false);
+      setPracticeOver(false);
+      setPracticeReason(null);
+      setPracticeTurns(0);
+      setClientLine(null);
+      setElapsedMs(0);
     };
 
     if (!sessionId) {
@@ -607,6 +911,27 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
     }, DROP_POLL_MS);
     return () => clearInterval(id);
   }, []);
+
+  /* ---------------------------------------------------------------- */
+  /* the practice clock                                                */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * One interval for the whole page, and only while a practice call is running.
+   * It is cleared when the call ends, because the effect stops depending on a
+   * true condition, and on unmount, because that is the cleanup.
+   */
+  useEffect(() => {
+    if (!practiceStarted || practiceOver) return;
+
+    const id = setInterval(() => {
+      const startedAt = practiceStartedAtRef.current;
+      if (startedAt === null) return;
+      setElapsedMs(Date.now() - startedAt);
+    }, PRACTICE_TICK_MS);
+
+    return () => clearInterval(id);
+  }, [practiceStarted, practiceOver]);
 
   /* ---------------------------------------------------------------- */
   /* devices                                                           */
@@ -712,6 +1037,11 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
           deviceId: source.deviceId,
           useDisplayMedia: source.useDisplayMedia,
           onFrame: (pcm: ArrayBuffer) => {
+            // The practice half duplex gate. It is only ever shut while the
+            // browser is saying a client line out loud, which needs a
+            // client_turn frame first, so on a live call this reads false for
+            // the whole call and every frame goes out as before.
+            if (micGateRef.current) return;
             socketRef.current?.sendAudio(streamId, pcm);
           },
           onLevel: (rms: number) => {
@@ -874,6 +1204,110 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
     socketRef.current?.send({ type: "control", action: "reset", stream: "all" });
   }, [cancelTextFrame]);
 
+  /* ---------------------------------------------------------------- */
+  /* practice actions                                                  */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Start the rehearsal.
+   *
+   * This must be called from a click. Browsers only let a page talk after a real
+   * user gesture, so the speech engine is woken up here, inside that gesture,
+   * with a silent zero length line. Waking it later, when the client's first
+   * line arrives over the socket, is too late and the line is dropped without
+   * an error.
+   */
+  const startPractice = useCallback(() => {
+    // Priming comes first, before any early return, because this is the one
+    // moment we are certain a real click is on the stack. A click that could not
+    // reach the server still leaves the engine unlocked for the next try.
+    primeSpeech();
+
+    const socket = socketRef.current;
+    if (!socket || socket.state !== "open") {
+      setError("Not connected to the server yet, so the practice call could not start.");
+      return;
+    }
+
+    practiceStartedAtRef.current = Date.now();
+    setElapsedMs(0);
+    setPracticeStarted(true);
+    setPracticeOver(false);
+    setPracticeReason(null);
+    setPracticeTurns(0);
+    setClientLine(null);
+    setError(null);
+
+    socket.send({ type: "practice_start" });
+  }, []);
+
+  /**
+   * Stop the rehearsal and ask for a score.
+   *
+   * The server answers with practice_over, which is what actually ends the call.
+   * When there is no socket left to answer, the call is ended here instead, so
+   * the rep is never stuck on a screen that says the call is still running.
+   */
+  const endPractice = useCallback(() => {
+    cancelSpeech();
+    openMicGate();
+
+    const socket = socketRef.current;
+    if (socket && socket.state === "open") {
+      socket.send({ type: "practice_end" });
+      return;
+    }
+
+    setPracticeOver(true);
+    setPracticeReason("rep_ended");
+    const startedAt = practiceStartedAtRef.current;
+    if (startedAt !== null) setElapsedMs(Date.now() - startedAt);
+  }, [openMicGate]);
+
+  /**
+   * Talk over the client.
+   *
+   * The speech stops on the word it is on and the microphone comes straight
+   * back. cancelSpeech fires the line's own end callback, which opens the gate,
+   * and the second call here covers the browsers where a cancel never fires
+   * anything at all.
+   */
+  const cutIn = useCallback(() => {
+    cancelSpeech();
+    openMicGate();
+  }, [openMicGate]);
+
+  const practice = useMemo<PracticeApi>(
+    () => ({
+      active: practiceEnabled,
+      started: practiceStarted,
+      over: practiceOver,
+      reason: practiceReason,
+      turns: practiceTurns,
+      difficulty,
+      clientSpeaking,
+      clientLine,
+      elapsedMs,
+      startPractice,
+      endPractice,
+      cutIn,
+    }),
+    [
+      practiceEnabled,
+      practiceStarted,
+      practiceOver,
+      practiceReason,
+      practiceTurns,
+      difficulty,
+      clientSpeaking,
+      clientLine,
+      elapsedMs,
+      startPractice,
+      endPractice,
+      cutIn,
+    ],
+  );
+
   return useMemo<TeleprompterApi>(
     () => ({
       status,
@@ -894,6 +1328,7 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
       sensitivity,
       busy,
       error,
+      practice,
       startClient,
       startRep,
       stopStream,
@@ -903,6 +1338,9 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
       setSensitivity,
       refreshDevices,
       reset,
+      startPractice,
+      endPractice,
+      cutIn,
     }),
     [
       status,
@@ -923,6 +1361,7 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
       sensitivity,
       busy,
       error,
+      practice,
       startClient,
       startRep,
       stopStream,
@@ -932,6 +1371,9 @@ export function useTeleprompter(sessionId: string | null): TeleprompterApi {
       setSensitivity,
       refreshDevices,
       reset,
+      startPractice,
+      endPractice,
+      cutIn,
     ],
   );
 }

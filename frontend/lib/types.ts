@@ -1,12 +1,13 @@
 /**
  * Shared type surface for the whole frontend.
  *
- * These types mirror the frozen wire protocol in CONTRACT.md section 2.2 exactly.
+ * These types mirror the frozen wire protocol in CONTRACT.md section 2.2 and the
+ * practice mode additions in CONTRACT_PRACTICE.md sections 3 and 4, exactly.
  * Nothing here may be renamed or widened without changing the backend too.
  *
- * The two guards at the bottom are the trust boundary for anything that arrives
- * off the WebSocket. Everything crossing that boundary is `unknown` until a guard
- * says otherwise.
+ * The guards at the bottom are the trust boundary for anything that arrives off
+ * the WebSocket or out of a proxy route. Everything crossing that boundary is
+ * `unknown` until a guard says otherwise.
  */
 
 /** Which capture lane a chunk of audio or a transcript belongs to. */
@@ -68,6 +69,145 @@ export interface PreparedSession {
   hasNotes?: boolean;
 }
 
+/* ------------------------------------------------------------------ */
+/* Practice mode                                                       */
+/* ------------------------------------------------------------------ */
+
+/** A real call, or a rehearsal against the synthetic client. */
+export type CallMode = "live" | "practice";
+
+/** How hard the synthetic client is to sell to. */
+export type Difficulty = "warm" | "normal" | "brutal";
+
+/** One difficulty card, from GET /api/practice/difficulties. */
+export interface DifficultyInfo {
+  key: Difficulty;
+  label: string;
+  /** One plain line the rep reads before choosing. */
+  blurb: string;
+}
+
+/** How the synthetic client sounds right now. */
+export type ClientMood = "cold" | "neutral" | "warm";
+
+/** What the synthetic client is doing with this turn. */
+export type ClientIntent = "question" | "objection" | "brushoff" | "agree" | "hangup";
+
+/**
+ * The push back the synthetic client just used, or "none".
+ *
+ * These are the frozen persona keys from CONTRACT_PRACTICE.md section 2. They
+ * overlap the quick action keys by design but they are a separate, closed list,
+ * so keep them separate from `QuickAction.key`, which the backend owns.
+ */
+export type PersonaObjection =
+  | "too_expensive"
+  | "not_interested"
+  | "no_time"
+  | "have_vendor"
+  | "send_email"
+  | "who_are_you"
+  | "none";
+
+/** Why the practice call stopped. */
+export type PracticeOverReason = "hangup" | "rep_ended" | "goal_reached" | "turn_limit";
+
+/** How the practice call finished, decided by the coach model. */
+export type PracticeOutcome = "booked" | "soft_yes" | "no_answer" | "hung_up";
+
+/** The one word the scorecard puts next to the number. */
+export type DebriefGrade = "Good" | "Getting there" | "Needs work" | "Rough";
+
+/**
+ * The result of POST /api/practice/start.
+ *
+ * Everything a prepared session carries, plus the four fields the practice call
+ * page needs: which mode this is, how hard the client is, what the client is
+ * called, and the first line the browser has to speak out loud.
+ */
+export interface PracticeSession extends PreparedSession {
+  mode: "practice";
+  difficulty: Difficulty;
+  /** The name the persona answers to, or null when none was found. */
+  personaName: string | null;
+  /** The line the client says before the rep says anything. */
+  openingLine: string;
+}
+
+/** The plain numbers, all counted in Python, never guessed by a model. */
+export interface DebriefMetrics {
+  repWords: number;
+  clientWords: number;
+  /** Rep words over total words, as a whole number from 0 to 100. */
+  talkingTimePct: number;
+  questionsAsked: number;
+  objectionsFaced: number;
+  objectionsHandled: number;
+  /** Mean gap between the client stopping and the rep starting, in milliseconds. */
+  avgReplyMs: number;
+  fillerWords: number;
+  longestSentenceWords: number;
+}
+
+/** One moment of the call, quoted three ways. */
+export interface DebriefMoment {
+  clientSaid: string;
+  copilotSaid: string;
+  youSaid: string;
+  why: string;
+}
+
+/** How much the teleprompter actually helped. */
+export interface DebriefCopilot {
+  suggestionsShown: number;
+  suggestionsUsed: number;
+  /** Used over shown, as a whole number from 0 to 100. */
+  usedPct: number;
+  /**
+   * Both moments are nullable. A call that ended after one turn has nothing to
+   * quote, and the contract says to return empty rather than invent filler.
+   */
+  bestMoment: DebriefMoment | null;
+  missedMoment: DebriefMoment | null;
+}
+
+/** One row of the score rubric, so the rep can see where the points came from. */
+export interface DebriefBreakdown {
+  label: string;
+  got: number;
+  outOf: number;
+  note: string;
+}
+
+/** One thing to say better next time. */
+export interface DebriefFix {
+  youSaid: string;
+  problem: string;
+  sayInstead: string;
+}
+
+/** The scorecard, from GET /api/practice/{sessionId}/debrief. */
+export interface Debrief {
+  sessionId: string;
+  difficulty: Difficulty;
+  durationMs: number;
+  turns: number;
+  outcome: PracticeOutcome;
+  /** 0 to 100, summed from the seven breakdown rows. */
+  score: number;
+  grade: DebriefGrade;
+  metrics: DebriefMetrics;
+  copilot: DebriefCopilot;
+  breakdown: DebriefBreakdown[];
+  wins: string[];
+  fixes: DebriefFix[];
+  nextDrill: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Wire frames                                                         */
+/* ------------------------------------------------------------------ */
+
 /** Server to client TEXT frames. */
 export type ServerMessage =
   | {
@@ -86,7 +226,19 @@ export type ServerMessage =
   | { type: "suggestion_delta"; id: string; delta: string }
   | { type: "suggestion_done"; id: string; text: string; firstTokenMs: number; totalMs: number; sttMs: number }
   | { type: "status"; state: "idle" | "listening" | "transcribing" | "thinking"; detail?: string }
-  | { type: "error"; code: string; message: string };
+  | { type: "error"; code: string; message: string }
+  | {
+      type: "client_turn";
+      id: string;
+      text: string;
+      mood: ClientMood;
+      intent: ClientIntent;
+      objection: PersonaObjection;
+      /** How long the persona model took, in milliseconds. */
+      ms: number;
+    }
+  | { type: "practice_over"; reason: PracticeOverReason; turns: number; message: string }
+  | { type: "practice_state"; turns: number; started: boolean };
 
 /** Client to server TEXT frames. Audio goes over BINARY frames instead. */
 export type ClientMessage =
@@ -94,7 +246,15 @@ export type ClientMessage =
   | { type: "control"; action: "start" | "stop" | "reset" | "flush"; stream: StreamKind | "all" }
   | { type: "quick_action"; key: string; note?: string }
   | { type: "manual_text"; text: string; stream: StreamKind }
-  | { type: "config"; sensitivity?: number; autoSuggest?: boolean };
+  | { type: "config"; sensitivity?: number; autoSuggest?: boolean }
+  | { type: "practice_start" }
+  | { type: "practice_end" }
+  /**
+   * True while the browser is speaking the client line out loud. The rep's
+   * frames must not be sent while this is true, and the server ignores any that
+   * still arrive.
+   */
+  | { type: "speech_state"; speaking: boolean };
 
 /* ------------------------------------------------------------------ */
 /* Guards                                                              */
@@ -130,12 +290,123 @@ function isStatusState(v: unknown): v is "idle" | "listening" | "transcribing" |
   return v === "idle" || v === "listening" || v === "transcribing" || v === "thinking";
 }
 
+function isClientMood(v: unknown): v is ClientMood {
+  return v === "cold" || v === "neutral" || v === "warm";
+}
+
+function isClientIntent(v: unknown): v is ClientIntent {
+  return (
+    v === "question" ||
+    v === "objection" ||
+    v === "brushoff" ||
+    v === "agree" ||
+    v === "hangup"
+  );
+}
+
+function isPersonaObjection(v: unknown): v is PersonaObjection {
+  return (
+    v === "too_expensive" ||
+    v === "not_interested" ||
+    v === "no_time" ||
+    v === "have_vendor" ||
+    v === "send_email" ||
+    v === "who_are_you" ||
+    v === "none"
+  );
+}
+
+function isPracticeOverReason(v: unknown): v is PracticeOverReason {
+  return v === "hangup" || v === "rep_ended" || v === "goal_reached" || v === "turn_limit";
+}
+
+function isPracticeOutcome(v: unknown): v is PracticeOutcome {
+  return v === "booked" || v === "soft_yes" || v === "no_answer" || v === "hung_up";
+}
+
+function isDebriefGrade(v: unknown): v is DebriefGrade {
+  return v === "Good" || v === "Getting there" || v === "Needs work" || v === "Rough";
+}
+
+function isDebriefMetrics(v: unknown): v is DebriefMetrics {
+  return (
+    isRecord(v) &&
+    isNum(v.repWords) &&
+    isNum(v.clientWords) &&
+    isNum(v.talkingTimePct) &&
+    isNum(v.questionsAsked) &&
+    isNum(v.objectionsFaced) &&
+    isNum(v.objectionsHandled) &&
+    isNum(v.avgReplyMs) &&
+    isNum(v.fillerWords) &&
+    isNum(v.longestSentenceWords)
+  );
+}
+
+function isDebriefMoment(v: unknown): v is DebriefMoment {
+  return (
+    isRecord(v) &&
+    isStr(v.clientSaid) &&
+    isStr(v.copilotSaid) &&
+    isStr(v.youSaid) &&
+    isStr(v.why)
+  );
+}
+
+/** A moment slot: the object, or null when the call had nothing to quote. */
+function isMomentOrNull(v: unknown): v is DebriefMoment | null {
+  return v === null || isDebriefMoment(v);
+}
+
+function isDebriefCopilot(v: unknown): v is DebriefCopilot {
+  return (
+    isRecord(v) &&
+    isNum(v.suggestionsShown) &&
+    isNum(v.suggestionsUsed) &&
+    isNum(v.usedPct) &&
+    isMomentOrNull(v.bestMoment) &&
+    isMomentOrNull(v.missedMoment)
+  );
+}
+
+function isDebriefBreakdown(v: unknown): v is DebriefBreakdown {
+  return isRecord(v) && isStr(v.label) && isNum(v.got) && isNum(v.outOf) && isStr(v.note);
+}
+
+function isDebriefFix(v: unknown): v is DebriefFix {
+  return isRecord(v) && isStr(v.youSaid) && isStr(v.problem) && isStr(v.sayInstead);
+}
+
 /**
  * True when `v` is one of the two capture lane names.
  * Anything else (including a stream id number) is rejected.
  */
 export function isStreamKind(v: unknown): v is StreamKind {
   return v === "client" || v === "rep";
+}
+
+/** True when `v` is one of the three frozen difficulty keys. */
+export function isDifficulty(v: unknown): v is Difficulty {
+  return v === "warm" || v === "normal" || v === "brutal";
+}
+
+/**
+ * True when a stored session was prepared for practice.
+ *
+ * A live session has no `mode` field at all, so this is the one safe way to tell
+ * the two apart after they come back out of localStorage.
+ */
+export function isPracticeSession(
+  s: PreparedSession | PracticeSession | null,
+): s is PracticeSession {
+  if (s === null) return false;
+  const candidate = s as Partial<PracticeSession>;
+  return (
+    candidate.mode === "practice" &&
+    isDifficulty(candidate.difficulty) &&
+    typeof candidate.openingLine === "string" &&
+    (candidate.personaName === null || typeof candidate.personaName === "string")
+  );
 }
 
 /**
@@ -147,6 +418,10 @@ export function isStreamKind(v: unknown): v is StreamKind {
  * server or a hostile socket cannot smuggle `undefined` into the render path.
  * Unknown extra fields are allowed, so the backend can add fields without
  * breaking an older client.
+ *
+ * The practice frames are checked just as tightly. `mood`, `intent` and
+ * `objection` must already be one of the frozen persona values, so the server is
+ * the one that has to clean up a sloppy model reply, not the browser.
  */
 export function isServerMessage(v: unknown): v is ServerMessage {
   if (!isRecord(v) || !isStr(v.type)) return false;
@@ -195,7 +470,48 @@ export function isServerMessage(v: unknown): v is ServerMessage {
       return isStatusState(v.state) && (v.detail === undefined || isStr(v.detail));
     case "error":
       return isStr(v.code) && isStr(v.message);
+    case "client_turn":
+      return (
+        isStr(v.id) &&
+        isStr(v.text) &&
+        isClientMood(v.mood) &&
+        isClientIntent(v.intent) &&
+        isPersonaObjection(v.objection) &&
+        isNum(v.ms)
+      );
+    case "practice_over":
+      return isPracticeOverReason(v.reason) && isNum(v.turns) && isStr(v.message);
+    case "practice_state":
+      return isNum(v.turns) && isBool(v.started);
     default:
       return false;
   }
+}
+
+/**
+ * True when `v` is a complete scorecard.
+ *
+ * Used by the debrief proxy route, which forwards whatever FastAPI returned. The
+ * overlay reads every one of these fields without a fallback, so a half built
+ * payload has to be caught here and shown as an error instead of rendering a
+ * panel full of blanks. The lists may be empty, that is a real answer for a call
+ * that ended after one turn, but they must be arrays of the right shape.
+ */
+export function isDebrief(v: unknown): v is Debrief {
+  if (!isRecord(v)) return false;
+
+  if (!isStr(v.sessionId)) return false;
+  if (!isDifficulty(v.difficulty)) return false;
+  if (!isNum(v.durationMs) || !isNum(v.turns) || !isNum(v.score)) return false;
+  if (!isPracticeOutcome(v.outcome) || !isDebriefGrade(v.grade)) return false;
+  if (!isStr(v.nextDrill)) return false;
+
+  if (!isDebriefMetrics(v.metrics)) return false;
+  if (!isDebriefCopilot(v.copilot)) return false;
+
+  if (!Array.isArray(v.breakdown) || !v.breakdown.every(isDebriefBreakdown)) return false;
+  if (!Array.isArray(v.wins) || !v.wins.every(isStr)) return false;
+  if (!Array.isArray(v.fixes) || !v.fixes.every(isDebriefFix)) return false;
+
+  return true;
 }

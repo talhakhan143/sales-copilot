@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { LucideIcon } from "lucide-react";
 import {
   ArrowRight,
   Check,
@@ -10,6 +11,8 @@ import {
   Copy,
   Crosshair,
   Globe,
+  GraduationCap,
+  Phone,
   RotateCcw,
   ServerCrash,
   Sparkles,
@@ -17,9 +20,17 @@ import {
   X,
 } from "lucide-react";
 
+import { DifficultyPicker } from "@/components/DifficultyPicker";
 import { LANGUAGES } from "@/lib/config";
 import { clearSession, loadSession, saveSession } from "@/lib/session";
-import type { PreparedSession } from "@/lib/types";
+import { isDifficulty, isPracticeSession } from "@/lib/types";
+import type {
+  CallMode,
+  Difficulty,
+  DifficultyInfo,
+  PracticeSession,
+  PreparedSession,
+} from "@/lib/types";
 
 /* ============================================================
    CONSTANTS
@@ -67,6 +78,59 @@ COMMON OBJECTIONS
 "You are too expensive." A cheap site that gets rebuilt twice costs more than one built right. The price and the date are fixed in writing, and I can send you the Aster numbers before you pay anything.
 
 "We already have a developer." Good, we work next to them. Most clients start us on the automation their developer never has time for, and nobody has to be replaced.`;
+
+/* ============================================================
+   PRACTICE MODE
+   ============================================================ */
+
+/**
+ * The three levels the picker shows.
+ *
+ * They ship in the bundle instead of being fetched. There is no browser route
+ * for GET /api/practice/difficulties, only the two proxies the practice
+ * contract asks for (start and debrief), so a fetch here would be a request
+ * that always fails and a list that never changed. The same three keys, in the
+ * same order, live in backend/app/practice.py, which is what the call is
+ * actually run with, so a blurb edited there has to be copied here.
+ */
+const DIFFICULTIES: DifficultyInfo[] = [
+  {
+    key: "warm",
+    label: "Warm",
+    blurb: "Friendly. They ask real questions and give you time to talk.",
+  },
+  {
+    key: "normal",
+    label: "Normal",
+    blurb: "Busy and short. They push back two or three times.",
+  },
+  {
+    key: "brutal",
+    label: "Brutal",
+    blurb: "They want to hang up. You get one line to keep them.",
+  },
+];
+
+/** The default level. Same default the backend uses when the field is missing. */
+const DEFAULT_DIFFICULTY: Difficulty = "normal";
+
+interface ModeChoice {
+  mode: CallMode;
+  label: string;
+  hint: string;
+  Icon: LucideIcon;
+}
+
+/** The two cells of the segmented control, in a fixed order. Real call is first. */
+const MODE_CHOICES: ModeChoice[] = [
+  { mode: "live", label: "Real call", hint: "A real person is on the phone", Icon: Phone },
+  {
+    mode: "practice",
+    label: "Practice call",
+    hint: "A robot client, for training",
+    Icon: GraduationCap,
+  },
+];
 
 /* ============================================================
    HEALTH PILL (header, client side polling)
@@ -314,11 +378,26 @@ type Notice =
   | { kind: "request"; detail: string };
 type CopyState = "none" | "done" | "failed";
 
-const PHASE_LABEL: Record<Phase, string> = {
-  idle: "Set up the call",
-  fetching: "Fetching site",
-  fusing: "Fusing context",
-  ready: "Ready",
+/**
+ * The button label per phase.
+ *
+ * A practice call runs the same two milestones (the client site is fetched, the
+ * notes are fused) and then builds the robot client on top, so it gets its own
+ * third label. Nothing about the live column changed.
+ */
+const PHASE_LABEL: Record<CallMode, Record<Phase, string>> = {
+  live: {
+    idle: "Set up the call",
+    fetching: "Fetching site",
+    fusing: "Fusing context",
+    ready: "Ready",
+  },
+  practice: {
+    idle: "Start practice call",
+    fetching: "Fetching site",
+    fusing: "Making the client",
+    ready: "Ready",
+  },
 };
 
 function shortId(id: string): string {
@@ -336,6 +415,7 @@ export function SetupForm() {
   const router = useRouter();
   const formRef = useRef<HTMLFormElement>(null);
   const copyTimer = useRef<number | null>(null);
+  const modeName = useId();
 
   const [knowledgeBase, setKnowledgeBase] = useState("");
   const [urlRaw, setUrlRaw] = useState("");
@@ -343,9 +423,13 @@ export function SetupForm() {
   const [goal, setGoal] = useState("");
   const [language, setLanguage] = useState(LANGUAGES[0]?.code ?? "en");
 
+  /* Practice mode. Off unless the rep picks it, so the live path is untouched. */
+  const [mode, setMode] = useState<CallMode>("live");
+  const [difficulty, setDifficulty] = useState<Difficulty>(DEFAULT_DIFFICULTY);
+
   const [phase, setPhase] = useState<Phase>("idle");
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [result, setResult] = useState<PreparedSession | null>(null);
+  const [result, setResult] = useState<PreparedSession | PracticeSession | null>(null);
   const [resume, setResume] = useState<PreparedSession | null>(null);
   const [copy, setCopy] = useState<CopyState>("none");
 
@@ -372,6 +456,7 @@ export function SetupForm() {
   const busy = phase === "fetching" || phase === "fusing";
   const blocked = emptyKb || overLimit || urlState.kind === "bad";
   const buttonDisabled = blocked || busy || phase === "ready";
+  const practice = mode === "practice";
 
   const counterTone = overLimit ? "text-danger" : letters > KB_KEPT ? "text-warn" : "text-dim";
 
@@ -392,18 +477,23 @@ export function SetupForm() {
        3. The payload parsed and the session was saved. */
     setPhase(clientUrl ? "fetching" : "fusing");
 
+    /* Same body both ways, because you rehearse against the real client you are
+       about to call. Practice adds one field and one endpoint, nothing else. */
+    const body: Record<string, unknown> = {
+      knowledgeBase: knowledgeBase.trim(),
+      clientUrl,
+      clientContext: clientNotes.trim() || null,
+      callGoal: goal.trim() || null,
+      language,
+    };
+    if (practice) body.difficulty = difficulty;
+
     let res: Response;
     try {
-      res = await fetch("/api/prepare-context", {
+      res = await fetch(practice ? "/api/practice/start" : "/api/prepare-context", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          knowledgeBase: knowledgeBase.trim(),
-          clientUrl,
-          clientContext: clientNotes.trim() || null,
-          callGoal: goal.trim() || null,
-          language,
-        }),
+        body: JSON.stringify(body),
       });
     } catch (err) {
       setPhase("idle");
@@ -452,7 +542,7 @@ export function SetupForm() {
       return;
     }
 
-    const session: PreparedSession = {
+    const base: PreparedSession = {
       sessionId: payload.sessionId,
       systemPrompt: payload.systemPrompt,
       clientUrl: payload.clientUrl,
@@ -466,11 +556,31 @@ export function SetupForm() {
       language,
     };
 
+    let session: PreparedSession | PracticeSession = base;
+
+    if (practice) {
+      /* The four practice fields are read leniently. We know this is a practice
+         call because of the endpoint we just called, so a missing name or a
+         missing opening line is not worth throwing the whole session away for:
+         the opening line is spoken from the server over the socket anyway, and
+         this copy is only for the record. */
+      const extra = payload as unknown as Record<string, unknown>;
+      session = {
+        ...base,
+        mode: "practice",
+        difficulty: isDifficulty(extra.difficulty) ? extra.difficulty : difficulty,
+        personaName: typeof extra.personaName === "string" ? extra.personaName : null,
+        openingLine: typeof extra.openingLine === "string" ? extra.openingLine : "",
+      };
+    }
+
+    /* The whole object is written, practice fields included, so the call page can
+       tell a rehearsal from a real call after a refresh. */
     saveSession(session);
     setResult(session);
     setResume(null);
     setPhase("ready");
-  }, [blocked, busy, clientNotes, goal, knowledgeBase, language, urlState]);
+  }, [blocked, busy, clientNotes, difficulty, goal, knowledgeBase, language, practice, urlState]);
 
   const onSubmit = useCallback(
     (event: React.FormEvent<HTMLFormElement>) => {
@@ -506,10 +616,29 @@ export function SetupForm() {
     setResume(null);
   }, []);
 
+  /* The mode rides in the address bar as well as in storage, so the call page
+     knows which kind of call this is even on a machine where storage is off. */
   const openTeleprompter = useCallback(() => {
     if (!result) return;
-    router.push(`/call?session=${encodeURIComponent(result.sessionId)}`);
+    const query = `session=${encodeURIComponent(result.sessionId)}`;
+    router.push(isPracticeSession(result) ? `/call?${query}&mode=practice` : `/call?${query}`);
   }, [result, router]);
+
+  const pickMode = useCallback(
+    (next: CallMode) => {
+      setMode(next);
+      invalidate();
+    },
+    [invalidate],
+  );
+
+  const pickDifficulty = useCallback(
+    (next: Difficulty) => {
+      setDifficulty(next);
+      invalidate();
+    },
+    [invalidate],
+  );
 
   const primaryClass = `${PRIMARY_BUTTON} ${
     busy || phase === "ready"
@@ -518,6 +647,8 @@ export function SetupForm() {
         ? "pointer-events-none opacity-40"
         : "hover:opacity-90"
   }`;
+
+  const resultIsPractice = isPracticeSession(result);
 
   return (
     <form ref={formRef} onSubmit={onSubmit} onKeyDown={onKeyDown} className="mt-10" noValidate>
@@ -550,6 +681,87 @@ export function SetupForm() {
               Discard
             </button>
           </div>
+        </div>
+      ) : null}
+
+      {/* KIND OF CALL. Two native radios, so the arrow keys, the tab stop and the
+          screen reader wording are the browser's job and not ours. */}
+      <fieldset className="mb-4">
+        <legend className="sr-only">Pick the kind of call</legend>
+        <div className="seam-grid grid-cols-2">
+          {MODE_CHOICES.map((choice) => {
+            const on = mode === choice.mode;
+            return (
+              /* Same construction as the difficulty cards below: a 2 px accent
+                 bar in the cell gutter, an accent icon, and the product's 6 px
+                 square for "this one is on". One vocabulary, two controls. */
+              <label
+                key={choice.mode}
+                className={`relative flex cursor-pointer items-center gap-3 px-4 py-3 transition-colors duration-[120ms] ease-out ${
+                  on ? "bg-surface-2" : "bg-surface hover:bg-surface-2"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name={modeName}
+                  value={choice.mode}
+                  checked={on}
+                  onChange={() => pickMode(choice.mode)}
+                  className="peer sr-only"
+                />
+                {/* The focus ring for the hidden radio, drawn on the cell. */}
+                <span
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-0 hidden outline outline-2 outline-accent [outline-offset:-2px] peer-focus-visible:block"
+                />
+                {on ? (
+                  <span
+                    aria-hidden="true"
+                    className="pointer-events-none absolute inset-y-0 left-0 w-0.5 bg-accent"
+                  />
+                ) : null}
+                <choice.Icon
+                  className={`h-4 w-4 shrink-0 transition-colors duration-[120ms] ${
+                    on ? "text-accent" : "text-muted"
+                  }`}
+                  aria-hidden="true"
+                />
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className={`font-sans text-chip ${on ? "text-text" : "text-muted"}`}>
+                    {choice.label}
+                  </span>
+                  {/* --muted, not --dim. This one line is the only thing that
+                      tells the rep what the two modes are, so it has to pass
+                      the read it contrast bar (design spec 2.1 and 3.3). */}
+                  <span className="truncate font-mono text-micro font-normal uppercase tracking-[0.10em] text-muted">
+                    {choice.hint}
+                  </span>
+                </span>
+                <span
+                  aria-hidden="true"
+                  className={`h-1.5 w-1.5 shrink-0 ${
+                    on ? "bg-accent" : "border border-line-strong"
+                  }`}
+                />
+              </label>
+            );
+          })}
+        </div>
+        <p className="mt-2 font-sans text-[12px] leading-[18px] text-muted">
+          {practice
+            ? "Practice call: you talk to a robot client. Nobody real is on the phone, so you can say anything. At the end you get a score."
+            : "Real call: a real person is on the phone. The copilot writes your next line while they talk."}
+        </p>
+      </fieldset>
+
+      {practice ? (
+        <div className="mb-4">
+          <DifficultyPicker
+            levels={DIFFICULTIES}
+            value={difficulty}
+            onChange={pickDifficulty}
+            disabled={busy}
+          />
         </div>
       ) : null}
 
@@ -727,7 +939,7 @@ export function SetupForm() {
       {/* PRIMARY ACTION */}
       <button type="submit" disabled={buttonDisabled} className={`${primaryClass} mt-4`}>
         {phase === "ready" ? <Check className="h-3.5 w-3.5" aria-hidden="true" /> : null}
-        <span aria-live="polite">{PHASE_LABEL[phase]}</span>
+        <span aria-live="polite">{PHASE_LABEL[mode][phase]}</span>
         {busy ? (
           <span
             className="absolute inset-x-0 bottom-0 h-0.5 overflow-hidden bg-[#04121A]/30"
@@ -773,10 +985,15 @@ export function SetupForm() {
 
       {/* RESULT */}
       {result ? (
-        <section className="seam-grid mt-4 grid-cols-1" aria-label="Prepared call context">
+        <section
+          className="seam-grid mt-4 grid-cols-1"
+          aria-label={resultIsPractice ? "Prepared practice call" : "Prepared call context"}
+        >
           <div className="flex flex-col gap-3 bg-surface p-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <span className={FIELD_LABEL}>Your call is ready</span>
+              <span className={FIELD_LABEL}>
+                {resultIsPractice ? "Your practice call is ready" : "Your call is ready"}
+              </span>
               <div className="flex items-center gap-2">
                 <button type="button" onClick={() => void copyPrompt()} className={MICRO_BUTTON}>
                   <Copy className="h-3 w-3" aria-hidden="true" />
@@ -793,6 +1010,33 @@ export function SetupForm() {
                 </button>
               </div>
             </div>
+
+            {/* The one thing the rep must not get wrong about a practice call. */}
+            {isPracticeSession(result) ? (
+              <div className="flex gap-3 border-l-2 border-accent-2 bg-surface-2 p-3">
+                <GraduationCap
+                  className="mt-0.5 h-4 w-4 shrink-0 text-accent-2"
+                  aria-hidden="true"
+                />
+                <div className="flex min-w-0 flex-col gap-1">
+                  <p className="font-sans text-body text-muted">
+                    This is a practice call. The client is a robot, not a real person. You are
+                    not calling anyone. It talks out loud through this browser, so turn your
+                    sound on. Level:{" "}
+                    {DIFFICULTIES.find((l) => l.key === result.difficulty)?.label ??
+                      result.difficulty}
+                    .
+                  </p>
+                  {/* --muted, not --dim. The rep is being asked to read this
+                      line, so it cannot sit at the dim contrast. */}
+                  {result.openingLine ? (
+                    <p className="font-mono text-micro font-normal tracking-[0.04em] text-muted">
+                      It starts with: {result.openingLine}
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
 
             <div className="flex flex-col gap-1">
               <p className="text-lede text-text">
@@ -883,11 +1127,13 @@ export function SetupForm() {
               onClick={openTeleprompter}
               className={`${PRIMARY_BUTTON} hover:opacity-90`}
             >
-              Open teleprompter
+              {resultIsPractice ? "Open the practice call" : "Open teleprompter"}
               <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
             <p className="mt-2 text-center font-mono text-micro uppercase text-muted">
-              Saved on this browser, so a refresh keeps the call alive
+              {resultIsPractice
+                ? "Turn your sound on, the client talks first"
+                : "Saved on this browser, so a refresh keeps the call alive"}
             </p>
           </div>
         </section>
