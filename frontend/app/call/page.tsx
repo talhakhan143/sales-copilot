@@ -43,7 +43,7 @@ import { Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } fr
 import type { FormEvent } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { ArrowLeft, Check, Copy, ExternalLink, ScrollText, Send, X } from "lucide-react";
+import { ArrowLeft, Check, Copy, ExternalLink, Plus, ScrollText, Send, X } from "lucide-react";
 
 import { AudioSourcePicker } from "@/components/AudioSourcePicker";
 import { CallLauncher, CallStateChip } from "@/components/CallLauncher";
@@ -1140,6 +1140,18 @@ function CallScreen() {
               </>
             )}
           </button>
+
+          {/* The next call is a different client, so it needs its own notes.
+              This goes back to the form with what you sell still filled in and
+              the client half empty, which is the whole shape of the app. */}
+          <Link
+            href="/"
+            title="Start a call with a different client"
+            className="hidden shrink-0 items-center gap-1.5 rounded-hair px-1 font-mono text-micro uppercase text-dim transition-colors duration-[120ms] hover:text-accent sm:inline-flex"
+          >
+            <Plus className="h-3 w-3" aria-hidden="true" />
+            NEW CALL
+          </Link>
         </div>
 
         <div className="flex shrink-0 items-center gap-2 sm:gap-2.5 lg:gap-4">

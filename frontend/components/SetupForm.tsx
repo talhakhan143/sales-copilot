@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { LucideIcon } from "lucide-react";
@@ -22,7 +21,8 @@ import {
 
 import { DifficultyPicker } from "@/components/DifficultyPicker";
 import { LANGUAGES } from "@/lib/config";
-import { clearSession, loadSession, saveSession } from "@/lib/session";
+import { clearProfile, loadProfile, saveProfile } from "@/lib/profile";
+import { saveSession } from "@/lib/session";
 import { isDifficulty, isPracticeSession } from "@/lib/types";
 import type {
   CallMode,
@@ -404,7 +404,7 @@ type CopyState = "none" | "done" | "failed";
  */
 const PHASE_LABEL: Record<CallMode, Record<Phase, string>> = {
   live: {
-    idle: "Set up the call",
+    idle: "Start the call",
     fetching: "Fetching site",
     fusing: "Fusing context",
     ready: "Ready",
@@ -448,16 +448,34 @@ export function SetupForm() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [notice, setNotice] = useState<Notice | null>(null);
   const [result, setResult] = useState<PreparedSession | PracticeSession | null>(null);
-  const [resume, setResume] = useState<PreparedSession | null>(null);
+  /* True once the saved profile has been read, so the page does not flash the
+     empty box before the remembered knowledge base lands. */
+  const [profileLoaded, setProfileLoaded] = useState(false);
+  /* True when what you sell came back from storage rather than being typed now.
+     It only decides whether that panel starts folded away. */
+  const [profileWasSaved, setProfileWasSaved] = useState(false);
+  const [sellOpen, setSellOpen] = useState(false);
   const [copy, setCopy] = useState<CopyState>("none");
 
-  /* A saved session means the rep can walk straight back into a call after a refresh. */
+  /* What you sell comes back. Who you are calling never does.
+     The old build remembered the whole session and offered to walk back into it,
+     which quietly invited calling the next client with the last one's notes
+     loaded. Now only the half that is genuinely yours is remembered. */
   useEffect(() => {
-    // localStorage does not exist during the prerender, so this cannot be a
-    // lazy initial state without the server and the client disagreeing about
-    // whether to paint the resume link.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setResume(loadSession());
+    // localStorage does not exist during the prerender, so this cannot be a lazy
+    // initial state without the server and the client disagreeing about what to
+    // paint. Reading it once after mount is the pattern.
+    const saved = loadProfile();
+    if (saved) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setKnowledgeBase(saved.knowledgeBase);
+      setLanguage(saved.language);
+      setProfileWasSaved(true);
+      setSellOpen(false);
+    } else {
+      setSellOpen(true);
+    }
+    setProfileLoaded(true);
   }, []);
 
   useEffect(() => {
@@ -605,9 +623,16 @@ export function SetupForm() {
       clientPhone: practice ? null : clientPhone.trim() || null,
     };
     saveSession(stored);
+    /* Only now, on a build that worked. Saving on every keystroke would remember
+       a half typed knowledge base. */
+    saveProfile({ knowledgeBase: knowledgeBase.trim(), language });
     setResult(session);
-    setResume(null);
     setPhase("ready");
+
+    /* Straight onto the glass. The old build parked the rep on a result card and
+       made them press a second button to open the thing they came for. */
+    const query = `session=${encodeURIComponent(session.sessionId)}`;
+    router.push(practice ? `/call?${query}&mode=practice` : `/call?${query}`);
   }, [
     blocked,
     busy,
@@ -618,6 +643,7 @@ export function SetupForm() {
     knowledgeBase,
     language,
     practice,
+    router,
     urlState,
   ]);
 
@@ -650,10 +676,15 @@ export function SetupForm() {
     copyTimer.current = window.setTimeout(() => setCopy("none"), COPY_ACK_MS);
   }, [result]);
 
-  const discardResume = useCallback(() => {
-    clearSession();
-    setResume(null);
-  }, []);
+  /* Forget what the rep sells, for a rep who sells something else now. Who they
+     are calling was never remembered, so there is nothing else to clear. */
+  const forgetProfile = useCallback(() => {
+    clearProfile();
+    setKnowledgeBase("");
+    setProfileWasSaved(false);
+    setSellOpen(true);
+    invalidate();
+  }, [invalidate]);
 
   /* The mode rides in the address bar as well as in storage, so the call page
      knows which kind of call this is even on a machine where storage is off. */
@@ -691,37 +722,6 @@ export function SetupForm() {
 
   return (
     <form ref={formRef} onSubmit={onSubmit} onKeyDown={onKeyDown} className="mt-10" noValidate>
-      {resume && !result ? (
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-hair border border-line-strong bg-surface px-4 py-2.5">
-          <div className="flex min-w-0 items-center gap-3">
-            <span className={FIELD_LABEL}>Your last call</span>
-            <span className="truncate font-sans text-body text-text">
-              {resume.clientTitle ?? resume.clientUrl ?? "Client not named"}
-            </span>
-            <span className="shrink-0 font-mono text-micro uppercase tabnum text-dim">
-              Ses {shortId(resume.sessionId)}
-            </span>
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <Link
-              href={`/call?session=${encodeURIComponent(resume.sessionId)}`}
-              className={MICRO_BUTTON}
-            >
-              <ArrowRight className="h-3 w-3" aria-hidden="true" />
-              Go back to your last call
-            </Link>
-            <button
-              type="button"
-              onClick={discardResume}
-              className={MICRO_BUTTON}
-              title="Forget the saved call on this browser"
-            >
-              <X className="h-3 w-3" aria-hidden="true" />
-              Discard
-            </button>
-          </div>
-        </div>
-      ) : null}
 
       {/* KIND OF CALL. Two native radios, so the arrow keys, the tab stop and the
           screen reader wording are the browser's job and not ours. */}
@@ -804,9 +804,41 @@ export function SetupForm() {
         </div>
       ) : null}
 
-      <div className="seam-grid grid-cols-1 lg:grid-cols-[1.15fr_1fr]">
+      {/* WHAT YOU SELL, FOLDED AWAY ONCE IT IS KNOWN.
+          This half belongs to the rep and barely changes, so after the first
+          call it collapses to one line and the client half gets the whole page.
+          That is the point of the split: the thing that changes every call is
+          the thing that should be in front of you. */}
+      {profileLoaded && !sellOpen ? (
+        <section className="mb-px flex flex-wrap items-center justify-between gap-3 bg-surface px-5 py-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className={FIELD_LABEL}>What you sell</span>
+            <span className="truncate font-sans text-body text-muted">
+              {knowledgeBase.trim().slice(0, 90)}
+              {knowledgeBase.trim().length > 90 ? "..." : ""}
+            </span>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <span className="font-mono text-micro uppercase tabnum text-dim">
+              {countLabel(letters)}
+            </span>
+            <button
+              type="button"
+              onClick={() => setSellOpen(true)}
+              className={MICRO_BUTTON}
+              title="Open the box and change what you sell"
+            >
+              Change
+            </button>
+          </div>
+        </section>
+      ) : null}
+
+      <div
+        className={`seam-grid grid-cols-1 ${sellOpen ? "lg:grid-cols-[1.15fr_1fr]" : ""}`}
+      >
         {/* KNOWLEDGE BASE */}
-        <section className="flex flex-col gap-3 bg-surface p-5">
+        <section className={`flex-col gap-3 bg-surface p-5 ${sellOpen ? "flex" : "hidden"}`}>
           <div className="flex items-center justify-between gap-3">
             <label htmlFor="kb" className={FIELD_LABEL}>
               What you sell
@@ -842,12 +874,39 @@ export function SetupForm() {
             placeholder="What you sell, your prices, why you are better, your proof, and the two objections you hear most."
             className="min-h-[260px] w-full resize-y rounded-hair border border-line-strong bg-surface-2 p-3 font-mono text-chip leading-5 text-text placeholder:text-dim"
           />
-          <span
-            id="kb-count"
-            className={`self-end font-mono text-micro uppercase tabnum ${counterTone}`}
-          >
-            {countLabel(letters)}
-          </span>
+          <div className="flex items-center justify-between gap-3">
+            {profileWasSaved ? (
+              <button
+                type="button"
+                onClick={forgetProfile}
+                className={MICRO_BUTTON}
+                title="Empty the box and forget what was saved"
+              >
+                <X className="h-3 w-3" aria-hidden="true" />
+                Forget this
+              </button>
+            ) : (
+              <span />
+            )}
+            <div className="flex items-center gap-3">
+              <span
+                id="kb-count"
+                className={`font-mono text-micro uppercase tabnum ${counterTone}`}
+              >
+                {countLabel(letters)}
+              </span>
+              {knowledgeBase.trim() ? (
+                <button
+                  type="button"
+                  onClick={() => setSellOpen(false)}
+                  className={MICRO_BUTTON}
+                  title="Fold this away and get on with the call"
+                >
+                  Done
+                </button>
+              ) : null}
+            </div>
+          </div>
         </section>
 
         {/* CLIENT */}

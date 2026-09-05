@@ -38,10 +38,10 @@ export default function Home() {
       </header>
 
       <main className="mx-auto w-full max-w-[980px] px-6 pb-24 pt-12">
-        <h1 className="text-h1 text-text">Set up your call, then open the teleprompter.</h1>
+        <h1 className="text-h1 text-text">Who are you calling?</h1>
         <p className="mt-2 max-w-[62ch] text-lede text-muted">
-          Write what you sell, point it at the client, and the copilot writes your next line
-          while they are still talking.
+          Tell the copilot about this one client. What you sell is saved already, so you only
+          do this bit. Then the teleprompter opens and writes your next line while they talk.
         </p>
 
         <SetupForm />
