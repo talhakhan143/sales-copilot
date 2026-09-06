@@ -1030,7 +1030,11 @@ class TeleprompterConnection:
             )
         except GroqError as exc:
             await self._send(
-                {"type": "error", "code": "stt_failed", "message": f"Transcription failed: {exc}"}
+                {
+                    "type": "error",
+                    "code": "stt_failed",
+                    "message": _plain_groq_error(exc, "Could not hear that line."),
+                }
             )
             await self._status("idle")
             return
@@ -1253,7 +1257,11 @@ class TeleprompterConnection:
             raise
         except GroqError as exc:
             await self._send(
-                {"type": "error", "code": "llm_failed", "message": f"Suggestion failed: {exc}"}
+                {
+                    "type": "error",
+                    "code": "llm_failed",
+                    "message": _plain_groq_error(exc, "Could not write the next line."),
+                }
             )
         except Exception as exc:  # noqa: BLE001 - report, do not die.
             log.exception("llm stream failed on session %s", self._session.id)

@@ -182,10 +182,23 @@ words. It sounds like you rather than like somebody reading a script.
 Line     I hear you. We start at 3,500 dollars. It brings new orders
          every day. Shall we look at the plan?
 
-Points   3500 USD, 2 to 4 weeks
+Points   I hear you
+         costs less than one lost order
          Aster cut calls 61 percent
-         ask for 15 minutes
+         3500 USD, ready in 2 weeks
+         15 minutes to show you
 ```
+
+Each point is a piece of what you would actually say, in the order you would say
+them. You glue them together with your own small words and it comes out as: "I
+hear you. Honestly it costs less than one lost order. We did this for Aster
+Dental and their calls dropped 61 percent. It is 3,500 and ready in two weeks.
+Can I get 15 minutes to show you?"
+
+That is the difference between a point and a label. "price is fair" is a label,
+nobody says it out loud. "costs less than one lost order" is the argument in
+words that come out of a mouth. Same for instructions: "ask for the meeting" is a
+note to yourself, "15 minutes to show you" is what you say.
 
 The switch is remembered, so you set it once. Flipping it also rewrites the line
 already on the glass, so you see the change on the words in front of you rather

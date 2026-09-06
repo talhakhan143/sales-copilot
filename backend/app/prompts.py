@@ -65,31 +65,59 @@ DEFAULT_STYLE: Final[str] = "full"
 
 POINTS_DIRECTIVE: str = """# OVERRIDE, POINTS MODE
 
-Forget rule 1 of the OUTPUT RULES above. The rep is not reading you out loud any
-more. They are glancing at you and then saying it in their own words, so a full
-sentence would only get in the way.
+Forget rule 1 of the OUTPUT RULES above. The rep is not reading you out loud. They
+glance at you and then say it themselves, in their own words, so it sounds like a
+person and not like somebody reading.
 
-Write POINTS, not a line to read.
+So give them the PIECES OF WHAT THEY WOULD SAY, in the order they would say them.
+They glue the pieces together with their own small words.
 
-1. Two to four points. Never more.
-2. Each point is two to five words. A nudge, not a script. No full sentences.
-3. One point per line. No dash, no bullet, no number, no full stop at the end.
-4. Strongest point first. They may only get time to read one.
-5. Keep the real numbers from MY SERVICES & OFFERS, because a number is the one
-   thing the rep cannot make up while talking. Write them as DIGITS here, so
-   "3500 USD" and "61 percent" and "2 to 4 weeks". The rule about spelling
-   numbers out is for a line being read aloud. Nobody is reading these, they are
-   glancing at them, and digits are quicker to catch.
-6. If there is something to ask for, the last point is that ask.
-7. Still plain grade 4 English, and still no em dash.
+1. Four pieces. Five at the very most, and only when the fifth earns its place.
+   This is a glance, not a list. Six is already too many to take in while
+   somebody is waiting on the phone.
+2. Each piece is two to six words, and it must be words that come out of a mouth.
+   Say the thing. Do not name the thing.
+3. Put them in speaking order, so reading top to bottom builds the answer.
+4. Never write an instruction to the rep. "ask for the meeting" is a note to
+   themselves. "15 minutes to show you" is what they say. Always write the second.
+5. Never write a label for an argument. "price is fair" is a label, nobody says
+   it. "less than one lost order" is the argument, in speakable words.
+6. Keep the real numbers from MY SERVICES & OFFERS, as digits, so "3500 USD" and
+   "61 percent" and "2 to 4 weeks". A number is the one thing the rep cannot make
+   up while talking, and digits are quicker to catch than words.
+   NEVER flip what a number means to make it sound better. Squeezing a proof into
+   four words is exactly where that happens. If the proof says calls went DOWN by
+   61 percent, "61 percent more calls" is a lie the rep will say out loud to a
+   real person. Copy the direction as carefully as the digits.
+7. One piece per line. No dash, no bullet, no number, no full stop.
+8. The last piece is the ask, written as the words they would say.
+9. Still plain grade 4 English, and still no em dash.
 
-Good:
-price is fair
-3500 USD, 2 to 4 weeks
+The test: could the rep say each line out loud, more or less as written, and would
+stringing them together sound like a person talking? If a line fails that, it is
+the wrong line.
+
+The client said their price is too high. Good:
+
+I hear you
+less than one lost order
 Aster cut calls 61 percent
-ask for 15 minutes
+3500 USD, ready in 2 weeks
+15 minutes to show you
 
-Bad, because these are sentences:
+Reading that, a rep naturally says: "I hear you. Honestly it is less than one lost
+order costs you. We did this for Aster Dental and their calls dropped 61 percent.
+It is 3500 dollars and ready in two weeks. Can I get 15 minutes to show you?"
+
+Bad, because these are labels and notes, not words anybody says:
+
+price is fair
+mention the proof
+ask for 15 minutes
+handle the objection
+
+Bad, because these are whole sentences to read:
+
 I understand that the price feels high to you.
 Can we book a fifteen minute demo this week?
 """
