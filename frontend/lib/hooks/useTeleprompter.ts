@@ -86,6 +86,7 @@ import { CaptureError, listInputDevices, startCapture } from "@/lib/audio/captur
 import type { CaptureHandle } from "@/lib/audio/capture";
 import { teleprompterWsUrl } from "@/lib/config";
 import { cancelSpeech, primeSpeech, rateForDifficulty, speak } from "@/lib/practice/speech";
+import { loadPromptStyle, savePromptStyle } from "@/lib/profile";
 import { TeleprompterSocket } from "@/lib/ws/client";
 import type {
   CallProvider,
@@ -94,6 +95,7 @@ import type {
   ConnState,
   Difficulty,
   PracticeOverReason,
+  PromptStyle,
   QuickAction,
   ServerMessage,
   StreamKind,
@@ -202,6 +204,10 @@ export interface TeleprompterApi {
   connState: ConnState;
   droppedFrames: number;
   sensitivity: number;
+  /** Whether the copilot writes a whole line or a few points. */
+  promptStyle: PromptStyle;
+  /** Switch between a line to read and points to speak around. */
+  setPromptStyle(next: PromptStyle): void;
   busy: StreamKind | null;
   error: string | null;
   call: CallSnapshot;
@@ -363,6 +369,7 @@ export function useTeleprompter(
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [droppedFrames, setDroppedFrames] = useState<number>(0);
   const [sensitivity, setSensitivityValue] = useState<number>(1);
+  const [promptStyle, setPromptStyleValue] = useState<PromptStyle>("full");
   const [busy, setBusy] = useState<StreamKind | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [call, setCall] = useState<CallSnapshot>(IDLE_CALL);
@@ -420,6 +427,10 @@ export function useTeleprompter(
 
   const busyRef = useRef<StreamKind | null>(null);
   const sensitivityRef = useRef<number>(1);
+  /* Read inside the ready handler, which runs from a socket callback, so it
+     has to be a ref as well as state or a reconnect would resend the style the
+     hook started with rather than the one the rep picked. */
+  const promptStyleRef = useRef<PromptStyle>("full");
   const capturesRef = useRef<StreamFlags>({ client: false, rep: false });
 
   /**
@@ -624,6 +635,9 @@ export function useTeleprompter(
           if (socket) {
             if (sensitivityRef.current !== 1) {
               socket.send({ type: "config", sensitivity: sensitivityRef.current });
+            }
+            if (promptStyleRef.current !== "full") {
+              socket.send({ type: "config", style: promptStyleRef.current });
             }
             if (capturesRef.current.client) {
               socket.send({ type: "control", action: "start", stream: "client" });
@@ -1049,6 +1063,17 @@ export function useTeleprompter(
     }
   }, []);
 
+  /* The rep's reading style is a preference, not a fact about this call, so it
+     comes back from storage on mount and is told to the server on ready. */
+  useEffect(() => {
+    const saved = loadPromptStyle();
+    promptStyleRef.current = saved;
+    if (saved !== "full") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setPromptStyleValue(saved);
+    }
+  }, []);
+
   const refreshDevices = useCallback(() => {
     void loadDevices();
   }, [loadDevices]);
@@ -1289,6 +1314,22 @@ export function useTeleprompter(
     socketRef.current?.send({ type: "config", sensitivity: safe });
   }, []);
 
+  /**
+   * Switch between a whole line to read and a few points to speak around.
+   *
+   * The server decides, not the browser: turning a finished sentence into points
+   * on this side would mangle it. So this only records the choice, remembers it
+   * for next time, and tells the server, which appends a different instruction
+   * to the next suggestion. The line already on the glass is left alone.
+   */
+  const setPromptStyle = useCallback((next: PromptStyle) => {
+    const safe: PromptStyle = next === "points" ? "points" : "full";
+    promptStyleRef.current = safe;
+    setPromptStyleValue(safe);
+    savePromptStyle(safe);
+    socketRef.current?.send({ type: "config", style: safe });
+  }, []);
+
   const reset = useCallback(() => {
     cancelTextFrame();
     committedRef.current = "";
@@ -1456,6 +1497,8 @@ export function useTeleprompter(
       connState,
       droppedFrames,
       sensitivity,
+      promptStyle,
+      setPromptStyle,
       busy,
       error,
       call,
@@ -1491,6 +1534,8 @@ export function useTeleprompter(
       connState,
       droppedFrames,
       sensitivity,
+      promptStyle,
+      setPromptStyle,
       busy,
       error,
       call,

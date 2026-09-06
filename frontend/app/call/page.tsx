@@ -471,6 +471,8 @@ function CallScreen() {
     devices,
     quickActions,
     sensitivity,
+    promptStyle,
+    setPromptStyle,
     busy,
     error,
     call,
@@ -1321,6 +1323,8 @@ function CallScreen() {
           sourceText={sourceText}
           idleHint={idleHint}
           status={status}
+          promptStyle={promptStyle}
+          onPromptStyle={setPromptStyle}
         />
 
         {/* In practice mode the wave moves up into this column, because its own

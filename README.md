@@ -168,6 +168,40 @@ tier about twice as fast as a real call. If you see "You have hit the free Groq 
 wait a minute.
 
 
+### Line, or points
+
+There is a switch in the teleprompter head: **Line** or **Points**.
+
+**Line** gives you the whole sentence to read out loud. That is what a nervous rep
+wants, and it is the default.
+
+**Points** gives you two to four short triggers instead, and you say it in your own
+words. It sounds like you rather than like somebody reading a script.
+
+```
+Line     I hear you. We start at 3,500 dollars. It brings new orders
+         every day. Shall we look at the plan?
+
+Points   3500 USD, 2 to 4 weeks
+         Aster cut calls 61 percent
+         ask for 15 minutes
+```
+
+The switch is remembered, so you set it once. Flipping it applies to the next line,
+not the one already on the glass.
+
+Two things happen on the server when you pick points, and both matter:
+
+- The rules change, so the model writes points natively rather than a sentence
+  being chopped up afterwards. Numbers come back as digits here, because you are
+  glancing at them rather than reading them out.
+- The copilot's own past lines stop being fed back to it. That was measured, not
+  guessed: with its own full sentences in the history the model imitates them and
+  keeps answering in sentences however firmly the rules say otherwise. It is also
+  simply more correct, since in points mode you never said the copilot's line, you
+  said your own words around it.
+
+
 ---
 
 ## Placing the call

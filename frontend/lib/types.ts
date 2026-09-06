@@ -14,6 +14,15 @@
 export type StreamKind = "client" | "rep";
 
 /** Lifecycle of the teleprompter WebSocket. */
+/**
+ * How the copilot writes a suggestion.
+ *
+ * ``full`` is a whole line to read out loud, which is what a nervous rep wants.
+ * ``points`` is two to four short triggers so an experienced rep speaks in their
+ * own words instead of sounding like somebody reading a script.
+ */
+export type PromptStyle = "full" | "points";
+
 export type ConnState = "idle" | "connecting" | "open" | "closed" | "reconnecting";
 
 /** What the call dashboard shows in the status pill. */
@@ -328,7 +337,7 @@ export type ClientMessage =
   | { type: "control"; action: "start" | "stop" | "reset" | "flush"; stream: StreamKind | "all" }
   | { type: "quick_action"; key: string; note?: string }
   | { type: "manual_text"; text: string; stream: StreamKind }
-  | { type: "config"; sensitivity?: number; autoSuggest?: boolean }
+  | { type: "config"; sensitivity?: number; autoSuggest?: boolean; style?: PromptStyle }
   | { type: "practice_start" }
   | { type: "practice_end" }
   /**

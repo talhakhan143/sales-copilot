@@ -48,7 +48,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
-from app import practice
+from app import practice, prompts
 from app.config import Settings, settings
 from app.prompts import QUICK_ACTIONS, quick_action_prompt
 from app.services import practice_engine
@@ -881,6 +881,13 @@ class TeleprompterConnection:
         if isinstance(raw_auto, bool):
             self._auto_suggest = raw_auto
 
+        # The reading style can flip in the middle of a live call, so it is not
+        # baked into the session's system prompt. It only picks which extra
+        # system message gets appended on the next suggestion.
+        raw_style = message.get("style")
+        if isinstance(raw_style, str) and raw_style.strip().lower() in prompts.STYLES:
+            self._session.style = raw_style.strip().lower()
+
     # ================================================================== #
     # utterance pipeline
     # ================================================================== #
@@ -1032,10 +1039,26 @@ class TeleprompterConnection:
         Returns:
             OpenAI style messages ready for ``stream_chat``.
         """
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": self._session.system_prompt}
-        ]
-        messages.extend(self._session.recent_messages(self._settings.transcript_window_turns))
+        directive = prompts.style_directive(self._session.style)
+
+        # The directive joins the rules block rather than trailing the history.
+        # Measured on the real model: with a few turns of history behind it, a
+        # trailing system message loses to the conversation's own momentum and
+        # the answer comes back as sentences anyway.
+        system = self._session.system_prompt
+        if directive:
+            system = f"{system}\n\n{directive}"
+
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+        messages.extend(
+            self._session.recent_messages(
+                self._settings.transcript_window_turns,
+                # The copilot's own past lines are the strongest pull back to
+                # full sentences, and in points mode they are not what the rep
+                # said either. See Session.recent_messages.
+                include_copilot=directive is None,
+            )
+        )
         return messages
 
     def _transcript_hint(self) -> str | None:

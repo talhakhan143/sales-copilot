@@ -24,7 +24,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, Copy, RotateCcw } from "lucide-react";
-import type { CallStatus, SuggestionTrigger } from "@/lib/types";
+import type { CallStatus, PromptStyle, SuggestionTrigger } from "@/lib/types";
 
 export interface TeleprompterProps {
   /** The suggestion currently streaming, or the last completed one. */
@@ -37,6 +37,17 @@ export interface TeleprompterProps {
   sourceText: string | null;
   /** Second idle line. Uppercase, it renders in the micro label style. */
   idleHint?: string;
+  /**
+   * How the copilot writes. "full" is a whole line to read out loud, "points"
+   * is a few words to speak around so the rep uses their own voice instead of
+   * sounding like somebody reading a script.
+   *
+   * Optional, so the older call sites still type check. Without the setter the
+   * switch is not drawn at all, rather than drawn and dead.
+   */
+  promptStyle?: PromptStyle;
+  /** Called with the style the rep just picked. */
+  onPromptStyle?: (next: PromptStyle) => void;
   /**
    * The hook's call status. Optional, so the frozen four prop call site still
    * type checks. Without it the cue window starts late (at the first token
@@ -98,6 +109,12 @@ const RAIL_OFF: RailStyle = { transform: "scaleX(0)", opacity: 0, transition: "n
  * whether the copy on the glass is live or stale. The cause gets its own word
  * beside it.
  */
+/** The two ways the copilot can write, as the head strip draws them. */
+const STYLE_CHOICES: readonly { value: PromptStyle; label: string; title: string }[] = [
+  { value: "full", label: "Line", title: "Give me the whole line to read out loud" },
+  { value: "points", label: "Points", title: "Give me a few words and I will say it myself" },
+];
+
 function kickerFor(cue: boolean, streaming: boolean, transcribing: boolean, live: boolean): string {
   if (cue) return "THINKING";
   if (streaming) return "RECEIVING";
@@ -166,6 +183,8 @@ export function Teleprompter({
   sourceText,
   idleHint,
   status,
+  promptStyle = "full",
+  onPromptStyle,
 }: TeleprompterProps) {
   const [phase, setPhase] = useState<Phase>("live");
   const [heldText, setHeldText] = useState("");
@@ -416,8 +435,20 @@ export function Teleprompter({
   const body = phase === "exit" ? heldText : phase === "blank" ? "" : text;
   const hasText = body.trim().length > 0;
 
+  /* Points arrive as one per line with no full stops, so splitting on sentence
+     ends would run all of them together into a paragraph and the rep would have
+     to read it rather than scan it, which is the whole thing points are for.
+     A newline in the text is the model saying "these are separate", so it wins
+     over punctuation whenever it is there. */
   const sentences = useMemo(() => {
     if (!hasText) return [] as string[];
+    if (body.includes("\n")) {
+      const lines = body
+        .split(/\n+/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      if (lines.length > 0) return lines;
+    }
     const parts = body.split(/(?<=[.?!])\s+/).filter((part) => part.trim().length > 0);
     return parts.length > 0 ? parts : [body];
   }, [body, hasText]);
@@ -489,6 +520,39 @@ export function Teleprompter({
         </div>
 
         <div className="flex shrink-0 items-center gap-1.5">
+          {/* READ IT, or SAY IT. Two segments rather than a checkbox, because a
+              checkbox makes the rep work out what the unchecked state means
+              while somebody is talking in their ear. Both words are always on
+              screen and one of them is lit. */}
+          {onPromptStyle ? (
+            <div
+              role="radiogroup"
+              aria-label="How the copilot writes"
+              className="mr-1 hidden overflow-hidden rounded-hair border border-line-strong sm:flex"
+            >
+              {STYLE_CHOICES.map((choice) => {
+                const on = promptStyle === choice.value;
+                return (
+                  <button
+                    key={choice.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={on}
+                    title={choice.title}
+                    onClick={() => onPromptStyle(choice.value)}
+                    className={`flex h-[24px] items-center px-2 font-mono text-micro uppercase tracking-[0.08em] transition-colors duration-[120ms] ease-out ${
+                      on
+                        ? "bg-surface-2 text-accent"
+                        : "text-dim hover:bg-surface-2 hover:text-muted"
+                    }`}
+                  >
+                    {choice.label}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
+
           <span className="inline-flex w-[56px] justify-end">
             {copied ? (
               <span className="copy-ack font-mono text-micro uppercase tracking-[0.08em] text-ok">

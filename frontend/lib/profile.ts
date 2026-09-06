@@ -107,3 +107,39 @@ export function clearProfile(): void {
     // Nothing more to do.
   }
 }
+
+const STYLE_KEY = "salescopilot:promptStyle";
+
+/**
+ * Remember whether the rep wants a whole line or a few points.
+ *
+ * It sits with the profile rather than the session because it is a preference
+ * about how this person likes to work, not a fact about the client they are
+ * calling. A rep who speaks in their own words wants that on every call.
+ *
+ * @param style - The choice to keep.
+ */
+export function savePromptStyle(style: "full" | "points"): void {
+  const store = storage();
+  if (!store) return;
+  try {
+    store.setItem(STYLE_KEY, style === "points" ? "points" : "full");
+  } catch {
+    // Storage is off. The default is the safe one, so this is survivable.
+  }
+}
+
+/**
+ * Read back the reading style.
+ *
+ * @returns The saved choice, or "full", which is the one a nervous rep needs.
+ */
+export function loadPromptStyle(): "full" | "points" {
+  const store = storage();
+  if (!store) return "full";
+  try {
+    return store.getItem(STYLE_KEY) === "points" ? "points" : "full";
+  } catch {
+    return "full";
+  }
+}

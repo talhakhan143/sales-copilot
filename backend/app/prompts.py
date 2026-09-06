@@ -53,6 +53,69 @@ next: a natural conversational response, or a fix for the objection they just ra
     the shortest natural human answer and nothing else.
 12. Answer in {language}."""
 
+
+# ===========================================================================
+# Reading style
+# ===========================================================================
+
+#: The two ways the teleprompter can feed a rep.
+STYLES: Final[tuple[str, ...]] = ("full", "points")
+
+DEFAULT_STYLE: Final[str] = "full"
+
+POINTS_DIRECTIVE: str = """# OVERRIDE, POINTS MODE
+
+Forget rule 1 of the OUTPUT RULES above. The rep is not reading you out loud any
+more. They are glancing at you and then saying it in their own words, so a full
+sentence would only get in the way.
+
+Write POINTS, not a line to read.
+
+1. Two to four points. Never more.
+2. Each point is two to five words. A nudge, not a script. No full sentences.
+3. One point per line. No dash, no bullet, no number, no full stop at the end.
+4. Strongest point first. They may only get time to read one.
+5. Keep the real numbers from MY SERVICES & OFFERS, because a number is the one
+   thing the rep cannot make up while talking. Write them as DIGITS here, so
+   "3500 USD" and "61 percent" and "2 to 4 weeks". The rule about spelling
+   numbers out is for a line being read aloud. Nobody is reading these, they are
+   glancing at them, and digits are quicker to catch.
+6. If there is something to ask for, the last point is that ask.
+7. Still plain grade 4 English, and still no em dash.
+
+Good:
+price is fair
+3500 USD, 2 to 4 weeks
+Aster cut calls 61 percent
+ask for 15 minutes
+
+Bad, because these are sentences:
+I understand that the price feels high to you.
+Can we book a fifteen minute demo this week?
+"""
+"""Appended as the last system message when the rep wants points.
+
+It goes last on purpose. The base prompt tells the model to write a line to read
+out loud, and the freshest instruction is the one a model follows, so this has to
+sit after it rather than being spliced into it. Keeping the two apart also means
+the style can be flipped in the middle of a live call without rebuilding the
+session's system prompt.
+"""
+
+
+def style_directive(style: str) -> str | None:
+    """Return the extra system message for a reading style.
+
+    Args:
+        style: ``"full"`` or ``"points"``. Anything unknown is treated as
+            ``"full"``, because a typo should not silently change how the
+            teleprompter reads mid call.
+
+    Returns:
+        The directive to append, or None when the base prompt already says it.
+    """
+    return POINTS_DIRECTIVE if str(style).strip().lower() == "points" else None
+
 NO_CLIENT_INFO: str = (
     "No public information was fetched for this prospect. Ask discovery questions "
     "before making claims."

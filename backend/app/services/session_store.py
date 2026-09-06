@@ -192,6 +192,10 @@ class Session:
     turns: deque[Turn] = field(default_factory=lambda: deque(maxlen=MAX_TURNS))
     client_title: str | None = None
     client_url: str | None = None
+    #: How the teleprompter feeds the rep: "full" for a whole line to read out
+    #: loud, "points" for a few words to speak around. It lives on the session
+    #: so a reconnect in the middle of a call does not silently flip it back.
+    style: str = "full"
     mode: SessionMode = "live"
     difficulty: str | None = None
     persona_name: str | None = None
@@ -331,7 +335,9 @@ class Session:
             lines.append(f"YOU: {text}")
         return "\n".join(lines)
 
-    def recent_messages(self, window: int) -> list[dict[str, str]]:
+    def recent_messages(
+        self, window: int, *, include_copilot: bool = True
+    ) -> list[dict[str, str]]:
         """Return the last ``window`` turns as OpenAI style chat messages.
 
         The system message is never included here, the caller prepends
@@ -340,6 +346,14 @@ class Session:
         Args:
             window: How many trailing turns to include. Values below 1 return
                 an empty list.
+            include_copilot: Whether the copilot's own past lines go back in as
+                assistant turns. Points mode turns this off, for two reasons.
+                The model imitates its own last answers, so full sentence
+                exemplars in the history drag every new answer back into full
+                sentences however firmly the rules say otherwise. And in points
+                mode the rep never said the copilot's line anyway, they said
+                their own words around it, so recording it as what was said is
+                simply wrong.
 
         Returns:
             Messages oldest first. A ``client`` turn becomes
@@ -356,7 +370,7 @@ class Session:
                 messages.append({"role": "user", "content": f"PROSPECT: {turn.text}"})
             elif turn.role == "rep":
                 messages.append({"role": "user", "content": f"REP (me): {turn.text}"})
-            else:
+            elif include_copilot:
                 messages.append({"role": "assistant", "content": turn.text})
         return messages
 
