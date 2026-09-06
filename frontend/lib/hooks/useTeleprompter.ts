@@ -419,6 +419,9 @@ export function useTeleprompter(
   const committedRef = useRef<string>("");
   const pendingRef = useRef<string>("");
   const currentIdRef = useRef<string | null>(null);
+  /* Mirrors the streaming flag. setPromptStyle is a stable callback, so reading
+     the state there would give the value captured at mount, forever false. */
+  const streamingRef = useRef<boolean>(false);
   const textRafRef = useRef<number | null>(null);
 
   const vadRafRef = useRef<number | null>(null);
@@ -709,6 +712,7 @@ export function useTeleprompter(
           // waiting for the prospect at the exact moment it is answering them.
           // The first committed word replaces it in one frame.
           // DESIGN.md section 5.4 CUE.
+          streamingRef.current = true;
           setStreaming(true);
           setTrigger(msg.trigger);
           setSourceText(msg.sourceText.length > 0 ? msg.sourceText : null);
@@ -752,6 +756,7 @@ export function useTeleprompter(
             committedRef.current = msg.text;
             pendingRef.current = "";
             setSuggestion(msg.text);
+            streamingRef.current = false;
             setStreaming(false);
             setStatus("ready");
             setLatency((prev) => ({
@@ -962,6 +967,7 @@ export function useTeleprompter(
       setMuted({ client: false, rep: false });
       setLevels({ client: 0, rep: 0 });
       setSpeaking({ client: false, rep: false });
+      streamingRef.current = false;
       setStreaming(false);
       setClientSpeaking(false);
 
@@ -1324,10 +1330,25 @@ export function useTeleprompter(
    */
   const setPromptStyle = useCallback((next: PromptStyle) => {
     const safe: PromptStyle = next === "points" ? "points" : "full";
+    if (safe === promptStyleRef.current) return;
+
     promptStyleRef.current = safe;
     setPromptStyleValue(safe);
     savePromptStyle(safe);
-    socketRef.current?.send({ type: "config", style: safe });
+
+    const socket = socketRef.current;
+    if (!socket) return;
+    socket.send({ type: "config", style: safe });
+
+    /* And write the line on the glass again in the new style. Without this the
+       switch only changes the NEXT suggestion, so the rep presses it, looks at
+       the same sentence still sitting there, and concludes it does nothing.
+       Only when there is something to rewrite, and never mid stream, since the
+       tokens still arriving are already in the old style and cancelling them to
+       start again would just look like a stutter. */
+    if (committedRef.current.trim().length > 0 && !streamingRef.current) {
+      socket.send({ type: "redo" });
+    }
   }, []);
 
   const reset = useCallback(() => {
@@ -1337,6 +1358,7 @@ export function useTeleprompter(
     currentIdRef.current = null;
 
     setSuggestion("");
+    streamingRef.current = false;
     setStreaming(false);
     setTrigger(null);
     setSourceText(null);

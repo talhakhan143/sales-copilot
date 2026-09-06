@@ -338,6 +338,9 @@ export type ClientMessage =
   | { type: "quick_action"; key: string; note?: string }
   | { type: "manual_text"; text: string; stream: StreamKind }
   | { type: "config"; sensitivity?: number; autoSuggest?: boolean; style?: PromptStyle }
+  /** Write the same moment again. The reading style switch uses this so the
+      line already on the glass changes, not just the next one. */
+  | { type: "redo" }
   | { type: "practice_start" }
   | { type: "practice_end" }
   /**

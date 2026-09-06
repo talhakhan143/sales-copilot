@@ -187,8 +187,11 @@ Points   3500 USD, 2 to 4 weeks
          ask for 15 minutes
 ```
 
-The switch is remembered, so you set it once. Flipping it applies to the next line,
-not the one already on the glass.
+The switch is remembered, so you set it once. Flipping it also rewrites the line
+already on the glass, so you see the change on the words in front of you rather
+than having to wait for the client to say something else. It will not interrupt a
+line that is still arriving, because cancelling half written tokens to start again
+just looks like a stutter.
 
 Two things happen on the server when you pick points, and both matter:
 

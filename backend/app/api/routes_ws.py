@@ -704,6 +704,8 @@ class TeleprompterConnection:
                 await self._handle_manual_text(message)
             elif kind == "config":
                 await self._handle_config(message)
+            elif kind == "redo":
+                await self._handle_redo()
             elif kind == "practice_start":
                 await self._handle_practice_start()
             elif kind == "practice_end":
@@ -861,6 +863,41 @@ class TeleprompterConnection:
             await self._notify_missing_key()
             return
         await self._start_llm(self._build_messages(), "manual", text, 0)
+
+    async def _handle_redo(self) -> None:
+        """Ask the copilot for the same moment again.
+
+        The reading style switch uses this. Without it, flipping to points only
+        changes the NEXT line, so the rep presses the switch, looks at the glass,
+        sees the same sentence sitting there and reasonably concludes it is
+        broken. Now the line in front of them changes.
+
+        The copilot's own last answer is dropped first, because it is the thing
+        being replaced. Leaving it in would have the model write a variation on
+        it, or treat it as already said and move the call forward instead.
+        """
+        if not self._groq.configured:
+            await self._notify_missing_key()
+            return
+
+        turns = self._session.turns
+        if turns and turns[-1].role == "copilot":
+            turns.pop()
+
+        # Answer the last thing the client actually said. With nothing to answer
+        # there is nothing to redo, and saying so is better than a blank screen.
+        source = next((t.text for t in reversed(turns) if t.role == "client"), "")
+        if not source:
+            await self._send(
+                {
+                    "type": "error",
+                    "code": "nothing_to_redo",
+                    "message": "There is no line to write again yet.",
+                }
+            )
+            return
+
+        await self._start_llm(self._build_messages(), "speech", source, 0)
 
     async def _handle_config(self, message: dict[str, Any]) -> None:
         """Apply live tuning: VAD sensitivity and the auto suggest switch.
