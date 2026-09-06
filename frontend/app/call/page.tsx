@@ -1143,14 +1143,19 @@ function CallScreen() {
 
           {/* The next call is a different client, so it needs its own notes.
               This goes back to the form with what you sell still filled in and
-              the client half empty, which is the whole shape of the app. */}
+              the client half empty, which is the whole shape of the app.
+
+              It is drawn as a bordered chip, the same as CALL and SOURCES on the
+              right, because it is an action. The first version wore the dim micro
+              type of the session id beside it, which reads as decoration, and a
+              rep looking for it could not find it. */}
           <Link
             href="/"
             title="Start a call with a different client"
-            className="hidden shrink-0 items-center gap-1.5 rounded-hair px-1 font-mono text-micro uppercase text-dim transition-colors duration-[120ms] hover:text-accent sm:inline-flex"
+            className="flex h-[26px] shrink-0 items-center gap-1.5 rounded-hair border border-line-strong px-2.5 font-mono text-micro uppercase text-muted transition-colors duration-[120ms] ease-out hover:bg-surface-2 hover:text-text"
           >
             <Plus className="h-3 w-3" aria-hidden="true" />
-            NEW CALL
+            <span>New call</span>
           </Link>
         </div>
 
@@ -1466,7 +1471,7 @@ function SessionGate({ kicker, line, body }: SessionGateProps) {
           className="mt-5 inline-flex h-11 items-center gap-2 rounded-hair border border-line-strong px-4 font-mono text-[12px] font-semibold uppercase tracking-[0.12em] text-accent transition-colors duration-[120ms] hover:bg-surface-2"
         >
           <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
-          BUILD CONTEXT
+          START A NEW CALL
         </Link>
       </div>
     </main>
