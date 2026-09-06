@@ -473,6 +473,7 @@ function CallScreen() {
     sensitivity,
     promptStyle,
     setPromptStyle,
+    rephrase,
     busy,
     error,
     call,
@@ -1325,6 +1326,7 @@ function CallScreen() {
           status={status}
           promptStyle={promptStyle}
           onPromptStyle={setPromptStyle}
+          onRephrase={rephrase}
         />
 
         {/* In practice mode the wave moves up into this column, because its own

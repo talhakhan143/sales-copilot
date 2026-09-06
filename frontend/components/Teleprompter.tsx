@@ -23,7 +23,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Check, Copy, RotateCcw } from "lucide-react";
+import { Check, Copy, RotateCcw, Shuffle } from "lucide-react";
 import type { CallStatus, PromptStyle, SuggestionTrigger } from "@/lib/types";
 
 export interface TeleprompterProps {
@@ -48,6 +48,11 @@ export interface TeleprompterProps {
   promptStyle?: PromptStyle;
   /** Called with the style the rep just picked. */
   onPromptStyle?: (next: PromptStyle) => void;
+  /**
+   * Ask for the same thing said a different way, because the client did not
+   * follow it. Optional, so the switch is not drawn when nobody is listening.
+   */
+  onRephrase?: () => void;
   /**
    * The hook's call status. Optional, so the frozen four prop call site still
    * type checks. Without it the cue window starts late (at the first token
@@ -185,6 +190,7 @@ export function Teleprompter({
   status,
   promptStyle = "full",
   onPromptStyle,
+  onRephrase,
 }: TeleprompterProps) {
   const [phase, setPhase] = useState<Phase>("live");
   const [heldText, setHeldText] = useState("");
@@ -419,6 +425,14 @@ export function Teleprompter({
       if (key === "c") {
         event.preventDefault();
         doCopy();
+      } else if (key === "a") {
+        // No "is there text" test here. `words` is derived further down, and
+        // the hook refuses a rephrase with nothing to reword anyway, so one
+        // guard in one place beats two that can disagree.
+        if (onRephrase) {
+          event.preventDefault();
+          onRephrase();
+        }
       } else if (key === "r") {
         event.preventDefault();
         doReplay();
@@ -426,7 +440,7 @@ export function Teleprompter({
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [doCopy, doReplay]);
+  }, [doCopy, doReplay, onRephrase]);
 
   /* ---------------------------------------------------------------- */
   /* Derived render values                                             */
@@ -579,6 +593,22 @@ export function Teleprompter({
               <Copy className="h-4 w-4" aria-hidden="true" />
             )}
           </button>
+
+          {/* The client did not follow that. Say it another way, simpler, from a
+              different angle. It is beside the other two because it belongs to
+              the same family: things you do to the line in front of you. */}
+          {onRephrase ? (
+            <button
+              type="button"
+              onClick={onRephrase}
+              disabled={words === 0}
+              title="They did not get it, say it another way (A)"
+              aria-label="Say this another way"
+              className="flex h-[26px] w-[26px] items-center justify-center rounded-hair text-muted opacity-45 transition-opacity duration-[140ms] ease-out hover:opacity-100 focus-visible:opacity-100 disabled:opacity-20 [@media(hover:none)]:opacity-100"
+            >
+              <Shuffle className="h-4 w-4" aria-hidden="true" />
+            </button>
+          ) : null}
 
           <button
             type="button"

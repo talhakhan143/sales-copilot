@@ -706,6 +706,8 @@ class TeleprompterConnection:
                 await self._handle_config(message)
             elif kind == "redo":
                 await self._handle_redo()
+            elif kind == "rephrase":
+                await self._handle_rephrase()
             elif kind == "practice_start":
                 await self._handle_practice_start()
             elif kind == "practice_end":
@@ -898,6 +900,50 @@ class TeleprompterConnection:
             return
 
         await self._start_llm(self._build_messages(), "speech", source, 0)
+
+    async def _handle_rephrase(self) -> None:
+        """Say the same thing again, a different way.
+
+        The rep presses this when the person on the phone did not follow the
+        line. So the failed line is remembered and handed back to the model as
+        something not to say again, and each press pushes it simpler.
+
+        Same shape as a redo: the copilot turn being replaced comes off the
+        transcript first, or the model writes a variation on it or decides the
+        point is made and moves the call on.
+        """
+        if not self._groq.configured:
+            await self._notify_missing_key()
+            return
+
+        turns = self._session.turns
+        if turns and turns[-1].role == "copilot":
+            failed = turns.pop().text.strip()
+            if failed and failed not in self._session.rephrase_attempts:
+                self._session.rephrase_attempts.append(failed)
+
+        if not self._session.rephrase_attempts:
+            await self._send(
+                {
+                    "type": "error",
+                    "code": "nothing_to_rephrase",
+                    "message": "There is no line to say another way yet.",
+                }
+            )
+            return
+
+        source = next((t.text for t in reversed(turns) if t.role == "client"), "")
+        # Keep the list short. Every attempt is more input tokens on a free key,
+        # and the model only needs the recent ones to avoid repeating itself.
+        del self._session.rephrase_attempts[:-3]
+        messages = self._build_messages()
+        messages.append(
+            {
+                "role": "system",
+                "content": prompts.rephrase_directive(list(self._session.rephrase_attempts)),
+            }
+        )
+        await self._start_llm(messages, "speech", source, 0)
 
     async def _handle_config(self, message: dict[str, Any]) -> None:
         """Apply live tuning: VAD sensitivity and the auto suggest switch.

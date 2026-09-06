@@ -208,6 +208,8 @@ export interface TeleprompterApi {
   promptStyle: PromptStyle;
   /** Switch between a line to read and points to speak around. */
   setPromptStyle(next: PromptStyle): void;
+  /** Ask for the same point in different, simpler words. */
+  rephrase(): void;
   busy: StreamKind | null;
   error: string | null;
   call: CallSnapshot;
@@ -1351,6 +1353,21 @@ export function useTeleprompter(
     }
   }, []);
 
+  /**
+   * Ask for the same point in different words.
+   *
+   * Used when the person on the phone did not follow the line. The server keeps
+   * what was already tried and pushes each attempt simpler, so pressing this
+   * repeatedly gives genuinely different explanations rather than the same
+   * sentence reworded.
+   */
+  const rephrase = useCallback(() => {
+    // Nothing to reword yet, and never mid stream: cancelling a half written
+    // line to start again reads as a stutter.
+    if (committedRef.current.trim().length === 0 || streamingRef.current) return;
+    socketRef.current?.send({ type: "rephrase" });
+  }, []);
+
   const reset = useCallback(() => {
     cancelTextFrame();
     committedRef.current = "";
@@ -1521,6 +1538,7 @@ export function useTeleprompter(
       sensitivity,
       promptStyle,
       setPromptStyle,
+      rephrase,
       busy,
       error,
       call,
@@ -1558,6 +1576,7 @@ export function useTeleprompter(
       sensitivity,
       promptStyle,
       setPromptStyle,
+      rephrase,
       busy,
       error,
       call,

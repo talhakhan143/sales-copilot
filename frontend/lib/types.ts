@@ -341,6 +341,8 @@ export type ClientMessage =
   /** Write the same moment again. The reading style switch uses this so the
       line already on the glass changes, not just the next one. */
   | { type: "redo" }
+  /** The client did not follow the line. Same point, different words. */
+  | { type: "rephrase" }
   | { type: "practice_start" }
   | { type: "practice_end" }
   /**

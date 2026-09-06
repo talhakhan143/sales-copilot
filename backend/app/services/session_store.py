@@ -196,6 +196,11 @@ class Session:
     #: loud, "points" for a few words to speak around. It lives on the session
     #: so a reconnect in the middle of a call does not silently flip it back.
     style: str = "full"
+    #: Lines already offered for the CURRENT client turn that the client did not
+    #: follow. The rep presses "another way" and this is what the copilot is told
+    #: not to say again. Cleared the moment the client says something new, since
+    #: at that point there is a different thing to answer.
+    rephrase_attempts: list[str] = field(default_factory=list)
     mode: SessionMode = "live"
     difficulty: str | None = None
     persona_name: str | None = None
@@ -233,6 +238,12 @@ class Session:
         if not cleaned:
             return
         now = time.time()
+        # A new client line is a new moment, so whatever the copilot already
+        # tried for the last one is no longer something to avoid repeating.
+        # Doing this here rather than at the call sites means it cannot be
+        # forgotten by a path added later.
+        if role == "client":
+            self.rephrase_attempts.clear()
         self.turns.append(Turn(role=role, text=cleaned, ts=now))
         self.last_seen = now
 

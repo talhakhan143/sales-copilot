@@ -218,6 +218,36 @@ Two things happen on the server when you pick points, and both matter:
   said your own words around it.
 
 
+### They did not get it
+
+Press the shuffle button in the teleprompter head, or the **A** key, and you get
+the same point said a different way. Press it again for another.
+
+```
+1  It shows your parts to more buyers. We build it in two to four weeks.
+2  More people find your parts online. We finish in two to four weeks.
+3  Think of it like a shop window. People see your parts all day.
+4  It is like a sign on the road. Cars see your parts when they drive by.
+```
+
+Each press changes the picture, not just the vocabulary. Swapping words for
+synonyms does not help somebody who did not follow you the first time, so the
+copilot is told what it already tried and made to come at it from a different
+angle, and to get simpler every time. From the third press on it is told to stop
+being clever and use an everyday example from the listener's own trade.
+
+The line never mentions the confusion. No "in other words", no "let me explain".
+The client should not feel slow, they should just understand.
+
+Real numbers survive every rewrite, exactly as written. "61 percent" does not
+quietly become "sixty percent" and "two to four weeks" does not become "three
+weeks", because a number the rep says out loud has to match the one they can
+back up.
+
+The list of failed attempts is thrown away the moment the client says something
+new, since at that point there is a different thing to answer.
+
+
 ---
 
 ## Placing the call

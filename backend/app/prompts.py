@@ -144,6 +144,57 @@ def style_directive(style: str) -> str | None:
     """
     return POINTS_DIRECTIVE if str(style).strip().lower() == "points" else None
 
+
+def rephrase_directive(attempts: list[str]) -> str:
+    """Build the override for "the client did not understand that".
+
+    The rep presses a button because the person on the phone did not follow the
+    line they just read. So this is not a retry, it is a second explanation, and
+    the two rules that matter are: go simpler, and do not say the same thing
+    again with different words.
+
+    Args:
+        attempts: The lines already offered for this same client turn, oldest
+            first. Every one of them failed to land.
+
+    Returns:
+        A system message to append after the base rules.
+    """
+    tried = "\n\n".join(f"Attempt {i}:\n{text}" for i, text in enumerate(attempts, 1))
+    harder = ""
+    if len(attempts) >= 2:
+        harder = (
+            "\nThis is attempt "
+            + str(len(attempts) + 1)
+            + ". The first two did not land, so stop being clever. Use the "
+            "smallest words you know and one everyday example a shopkeeper "
+            "would picture straight away.\n"
+        )
+    return f"""# OVERRIDE, THE CLIENT DID NOT UNDERSTAND
+
+The rep already said this to the client, for this exact moment, and the client
+did not follow it:
+
+{tried}
+
+Say the SAME thing again, a different way.
+{harder}
+1. Simpler than what is above. Shorter words, shorter sentences.
+2. A different angle, not the same sentence with the words swapped. If the last
+   try was about money, try time, or effort, or a plain example from their own
+   trade. Change the picture, not just the vocabulary.
+3. Do not reuse the unusual words from the attempts above. If a word did not land
+   the first time, it will not land the second.
+4. Never mention that they did not understand. Do not say "in other words", "let
+   me explain", "what I mean is", or anything that points at the confusion. Just
+   say it better.
+5. Keep any real number from MY SERVICES & OFFERS exactly as written. Do not
+   round it and do not soften it. "61 percent" does not become "sixty percent",
+   and "2 to 4 weeks" does not become "three weeks". Keep its direction too.
+6. Everything else in the OUTPUT RULES still holds, including the reading style
+   already in force.
+"""
+
 NO_CLIENT_INFO: str = (
     "No public information was fetched for this prospect. Ask discovery questions "
     "before making claims."
