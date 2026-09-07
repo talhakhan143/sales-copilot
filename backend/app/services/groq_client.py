@@ -61,6 +61,18 @@ RETRY_BACKOFFS: Final[tuple[float, ...]] = (0.4, 1.0)
 #: 413, 422) is a permanent client side mistake and retrying only wastes time.
 RETRYABLE_STATUSES: Final[frozenset[int]] = frozenset({408, 409, 429})
 
+#: Longest we will wait because a 429 asked us to, in seconds.
+#:
+#: The free tier caps input tokens per minute, and when a burst crosses that line
+#: Groq answers 429 with how long to wait, usually one or two seconds. Waiting is
+#: the right answer, because the alternative is the canned fallback line and the
+#: rep hears a robot say nothing useful.
+#:
+#: It is capped because there is a person on the phone. Past a couple of seconds
+#: of dead air the fallback really is better than the right answer, so a long
+#: retry-after is treated as a refusal rather than as an instruction to hang.
+RETRY_AFTER_CAP_S: Final[float] = 2.5
+
 #: Fallback WAV geometry used when a payload carries no parseable fmt chunk.
 DEFAULT_SAMPLE_RATE: Final[int] = 16000
 DEFAULT_CHANNELS: Final[int] = 1
@@ -306,6 +318,54 @@ def _decode_body(raw: bytes | str, limit: int = 700) -> str:
     if len(text) > limit:
         return text[:limit] + " [...]"
     return text
+
+
+#: Groq's own words for how long to wait, which are more precise than its header.
+_TRY_AGAIN_RE: Final[re.Pattern[str]] = re.compile(
+    r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE
+)
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    """How long the server asked us to wait, in seconds, or 0 when it did not.
+
+    Two places say it and they disagree, so both are read, body first.
+
+    The ``retry-after`` header is whole seconds and rounded up hard: a rate limit
+    that genuinely clears in 1.6 seconds arrives as ``11``. Taken at face value
+    that is a refusal, and every 429 would skip the wait entirely. The JSON body
+    carries the real figure, "Please try again in 1.662857142s", so that is the
+    number worth having and the header is only the fallback.
+
+    Args:
+        response: The 429 (or other retryable) response.
+
+    Returns:
+        Seconds to wait, at most :data:`RETRY_AFTER_CAP_S`. Zero when neither
+        source is readable, or when the wait is longer than the cap, which is
+        the signal to give up rather than to hold a live call open.
+    """
+    match = _TRY_AGAIN_RE.search(response.text or "")
+    if match:
+        try:
+            wanted = float(match.group(1))
+        except ValueError:
+            wanted = 0.0
+        if 0 < wanted <= RETRY_AFTER_CAP_S:
+            return wanted
+        if wanted > RETRY_AFTER_CAP_S:
+            return 0.0
+
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return 0.0
+    try:
+        wanted = float(str(raw).strip())
+    except ValueError:
+        return 0.0
+    if wanted <= 0 or wanted > RETRY_AFTER_CAP_S:
+        return 0.0
+    return wanted
 
 
 def _is_retryable_status(status: int) -> bool:
@@ -735,6 +795,7 @@ class GroqClient:
         last_error = ""
 
         for attempt in range(attempts):
+            asked = 0.0
             try:
                 response = await client.request(method, url, **kwargs)
             except httpx.TransportError as exc:
@@ -757,17 +818,25 @@ class GroqClient:
                 last_error = body
                 if not _is_retryable_status(response.status_code):
                     raise GroqError(response.status_code, body)
+                asked = _retry_after_seconds(response)
                 logger.debug(
-                    "groq %s attempt %d/%d retryable status %d: %s",
+                    "groq %s attempt %d/%d retryable status %d (retry-after %.2fs): %s",
                     label,
                     attempt + 1,
                     attempts,
                     response.status_code,
+                    asked,
                     body,
                 )
 
             if attempt < attempts - 1:
-                await asyncio.sleep(RETRY_BACKOFFS[attempt])
+                # The schedule is the floor, not the answer. A rate limited free
+                # tier says exactly how long it wants, and that is routinely a
+                # shade longer than the fixed backoff, which is how a retry that
+                # would have worked ends up spending both attempts too early and
+                # failing anyway.
+                await asyncio.sleep(max(RETRY_BACKOFFS[attempt], asked))
+                asked = 0.0
 
         raise GroqError(last_status, last_error or "request failed after retries")
 

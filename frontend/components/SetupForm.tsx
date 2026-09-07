@@ -20,14 +20,13 @@ import {
 } from "lucide-react";
 
 import { DifficultyPicker } from "@/components/DifficultyPicker";
-import { LANGUAGES } from "@/lib/config";
+import { DEFAULT_DIFFICULTY, DIFFICULTIES, LANGUAGES } from "@/lib/config";
 import { clearProfile, loadProfile, saveProfile } from "@/lib/profile";
 import { saveSession } from "@/lib/session";
 import { isDifficulty, isPracticeSession } from "@/lib/types";
 import type {
   CallMode,
   Difficulty,
-  DifficultyInfo,
   PracticeSession,
   PreparedSession,
 } from "@/lib/types";
@@ -93,27 +92,6 @@ COMMON OBJECTIONS
  * same order, live in backend/app/practice.py, which is what the call is
  * actually run with, so a blurb edited there has to be copied here.
  */
-const DIFFICULTIES: DifficultyInfo[] = [
-  {
-    key: "warm",
-    label: "Warm",
-    blurb: "Friendly. They ask real questions and give you time to talk.",
-  },
-  {
-    key: "normal",
-    label: "Normal",
-    blurb: "Busy and short. They push back two or three times.",
-  },
-  {
-    key: "brutal",
-    label: "Brutal",
-    blurb: "They want to hang up. You get one line to keep them.",
-  },
-];
-
-/** The default level. Same default the backend uses when the field is missing. */
-const DEFAULT_DIFFICULTY: Difficulty = "normal";
-
 interface ModeChoice {
   mode: CallMode;
   label: string;

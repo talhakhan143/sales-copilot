@@ -562,37 +562,83 @@ async def post_practice_start(
             detail="The practice call was lost right after it was made. Try again.",
         )
 
-    difficulty = _difficulty_key(getattr(payload, "difficulty", DEFAULT_DIFFICULTY))
-    persona_name = _persona_name(payload.client_context)
+    return PracticeStartResponse.model_validate(
+        {
+            **context.model_dump(by_alias=True),
+            **turn_into_practice(
+                session,
+                context,
+                knowledge_base=payload.knowledge_base,
+                client_context=payload.client_context,
+                call_goal=payload.call_goal,
+                difficulty=getattr(payload, "difficulty", DEFAULT_DIFFICULTY),
+            ),
+        }
+    )
+
+
+def turn_into_practice(
+    session: Session,
+    context: PrepareContextResponse,
+    *,
+    knowledge_base: str | None,
+    client_context: str | None,
+    call_goal: str | None,
+    difficulty: object,
+) -> dict[str, object]:
+    """Flip an already built session into a practice call, in place.
+
+    Everything up to here is the live call path: the scrape, the clamping, the
+    prompt fusion and the session itself. This is the only step that differs,
+    which is why it is one function and not a branch inside ``prepare_context``.
+
+    It is shared rather than copied because a practice call can start from two
+    places now, the setup form and a lead in the rep's list, and a persona that
+    behaves differently depending on which door it came through would make the
+    rehearsal worthless.
+
+    Args:
+        session: The live session, mutated into a practice one.
+        context: What ``prepare_context`` returned for it.
+        knowledge_base: The rep's offer sheet. Only the first
+            :data:`KNOWLEDGE_HINT_CHARS` reach the persona, because it plays the
+            prospect and must not know the rep's whole price list.
+        client_context: The notes about the prospect, which is where the persona
+            gets its name.
+        call_goal: What the rep is trying to get. Falls back when empty.
+        difficulty: Whatever the client asked for, coerced to a known level.
+
+    Returns:
+        The four practice fields, ready to merge into a response.
+    """
+    level = _difficulty_key(difficulty)
+    persona_name = _persona_name(client_context)
 
     session.mode = "practice"
-    session.difficulty = difficulty
+    session.difficulty = level
     session.persona_name = persona_name
-    session.client_block = _client_block(context, payload.client_context)
+    session.client_block = _client_block(context, client_context)
     session.knowledge_hint = clamp_on_word_boundary(
-        (payload.knowledge_base or "").strip(),
+        (knowledge_base or "").strip(),
         KNOWLEDGE_HINT_CHARS,
     )
-    session.call_goal = (payload.call_goal or "").strip() or FALLBACK_CALL_GOAL
+    session.call_goal = (call_goal or "").strip() or FALLBACK_CALL_GOAL
 
-    opening_line = practice.opening_line(difficulty, persona_name)
+    opening_line = practice.opening_line(level, persona_name)
 
     log.info(
         "Practice session %s ready, level=%s, name=%s",
         session.id,
-        difficulty,
+        level,
         persona_name or "none",
     )
 
-    return PracticeStartResponse.model_validate(
-        {
-            **context.model_dump(by_alias=True),
-            "mode": "practice",
-            "difficulty": difficulty,
-            "personaName": persona_name,
-            "openingLine": opening_line,
-        }
-    )
+    return {
+        "mode": "practice",
+        "difficulty": level,
+        "personaName": persona_name,
+        "openingLine": opening_line,
+    }
 
 
 @router.get("/{session_id}/debrief", response_model=DebriefResponse)

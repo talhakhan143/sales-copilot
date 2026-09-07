@@ -40,6 +40,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, GraduationCap, Plus, TriangleAlert, X } from "lucide-react";
 
+import { CallChoice } from "@/components/CallChoice";
 import { LeadDetail } from "@/components/LeadDetail";
 import { LeadList } from "@/components/LeadList";
 import { SearchPicker } from "@/components/SearchPicker";
@@ -61,9 +62,10 @@ import type {
   LeadsFailure,
   ScrapeJob,
 } from "@/lib/leads";
+import { DEFAULT_DIFFICULTY } from "@/lib/config";
 import { loadProfile } from "@/lib/profile";
 import { saveSession } from "@/lib/session";
-import type { LeadCallSession } from "@/lib/types";
+import type { CallMode, Difficulty, LeadCallSession } from "@/lib/types";
 
 /** How often the scrape job is asked what it is doing. */
 const POLL_MS = 2000;
@@ -228,6 +230,14 @@ export default function LeadsPage() {
   /* Which row the press that failed came from. The sentence goes under that
      row, so the rep reads it where their finger already is. */
   const [failKey, setFailKey] = useState<string | null>(null);
+
+  /* Which row is being asked how it wants to be called, and what it has picked
+     so far. The answer is deliberately not remembered between rows: a rep who
+     rehearsed against one business and then pressed Call on the next one must
+     not silently get a robot when they meant to ring a real person. */
+  const [askKey, setAskKey] = useState<string | null>(null);
+  const [askMode, setAskMode] = useState<CallMode>("live");
+  const [askLevel, setAskLevel] = useState<Difficulty>(DEFAULT_DIFFICULTY);
 
   const [newOpen, setNewOpen] = useState(false);
   const [niche, setNiche] = useState("");
@@ -475,9 +485,30 @@ export default function LeadsPage() {
      THE CALL
      ============================================================ */
 
+  /* Pressing Call no longer dials. It asks, under the row that was pressed,
+     because the same lead is worth two different things: ringing it, and
+     rehearsing against it first. The question is reset to a real call every
+     time it opens, so a rehearsal never leaks into the next press. */
+  const askLead = useCallback(
+    (lead: Lead) => {
+      if (callingKey) return;
+      setCallError(null);
+      setNoProfile(false);
+      setFailKey(null);
+      setAskMode("live");
+      setAskLevel(DEFAULT_DIFFICULTY);
+      setAskKey(lead.key);
+      setDetailKey(null);
+    },
+    [callingKey],
+  );
+
+  const closeAsk = useCallback(() => setAskKey(null), []);
+
   const callLead = useCallback(
-    async (lead: Lead) => {
+    async (lead: Lead, mode: CallMode, level: Difficulty) => {
       if (!searchId || callingKey || !canCall(lead)) return;
+      const practice = mode === "practice";
 
       /* Checked here as well as inside lib/leads.ts, because this is the only
          place that can also offer the way to fix it. The drawer is put away
@@ -499,11 +530,17 @@ export default function LeadsPage() {
       setFailKey(null);
       setCallingKey(lead.key);
 
-      const result = await startLeadCall(searchId, lead.key, { knowledgeBase, language });
+      const result = await startLeadCall(searchId, lead.key, {
+        knowledgeBase,
+        language,
+        mode,
+        difficulty: level,
+      });
       if (result.kind === "error") {
         setCallingKey(null);
         setCallError(sentence(result));
         setFailKey(lead.key);
+        setAskKey(null);
         setDetailKey(null);
         return;
       }
@@ -511,10 +548,15 @@ export default function LeadsPage() {
       /* Two fields more than the session itself: the lead's number, so the call
          page can dial without asking for it again, and the search id, so the
          outcome the rep picks afterwards lands on the right lead. Both names
-         are the ones the call page reads. */
+         are the ones the call page reads.
+
+         A rehearsal stores no number. Nobody is being rung, the dialler is not
+         on that screen, and a real business number sitting in storage behind a
+         practice call is exactly the kind of thing that gets dialled by
+         accident. */
       const stored: StoredLeadSession = {
         ...result.session,
-        clientPhone: lead.phone ? lead.phone.trim() : null,
+        clientPhone: practice ? null : lead.phone ? lead.phone.trim() : null,
         searchId,
       };
       saveSession(stored);
@@ -524,24 +566,58 @@ export default function LeadsPage() {
          as well as in storage, so the call page can ask what happened and offer
          the next lead even after a hard refresh. These two names match the ones
          the call page reads off the query string, and the ones it writes itself
-         when it moves the rep on to the next lead. */
-      const query = [
-        `session=${encodeURIComponent(result.session.sessionId)}`,
-        `leadKey=${encodeURIComponent(lead.key)}`,
-        `searchId=${encodeURIComponent(searchId)}`,
-      ].join("&");
+         when it moves the rep on to the next lead.
+
+         A rehearsal carries neither. It is not a lead call: nobody was rung, so
+         there is no outcome to write back and no next business to move on to.
+         It carries the practice flag instead, which is the same word the setup
+         form sends, so the call page opens the rehearsal screen it always did. */
+      const query = practice
+        ? [`session=${encodeURIComponent(result.session.sessionId)}`, "mode=practice"].join("&")
+        : [
+            `session=${encodeURIComponent(result.session.sessionId)}`,
+            `leadKey=${encodeURIComponent(lead.key)}`,
+            `searchId=${encodeURIComponent(searchId)}`,
+          ].join("&");
       router.push(`/call?${query}`);
     },
     [callingKey, router, searchId],
   );
 
-  const callFromDrawer = useCallback(() => {
-    if (detailLead) void callLead(detailLead);
-  }, [callLead, detailLead]);
+  /* What the Start button in the question runs. The lead is looked up again
+     rather than captured, because the list refetches while the question is open
+     and the row the rep pressed may be a different object by now. */
+  const startPicked = useCallback(() => {
+    const lead = leads.find((row) => row.key === askKey);
+    if (lead) void callLead(lead, askMode, askLevel);
+  }, [askKey, askLevel, askMode, callLead, leads]);
 
-  /* The one sentence a failed press produces, ready to be dropped under the row
-     that produced it. Only one of the two can be on at a time. */
-  const rowNotice: ReactNode = noProfile ? (
+  const callFromDrawer = useCallback(() => {
+    if (detailLead) askLead(detailLead);
+  }, [askLead, detailLead]);
+
+  /* One slot under one row, and three things that can want it: the question
+     about how to call, and the two sentences a failed press produces. They are
+     mutually exclusive by construction, because opening the question clears
+     both failures and a failure closes the question, so ranking them here is
+     enough and the list needs no second mechanism.
+
+     The question is first. A rep who just pressed Call is waiting on it. */
+  const asked = askKey === null ? null : leads.find((row) => row.key === askKey) ?? null;
+
+  const rowNotice: ReactNode = asked ? (
+    <CallChoice
+      leadName={asked.name}
+      canRing={canCall(asked)}
+      mode={askMode}
+      difficulty={askLevel}
+      onMode={setAskMode}
+      onDifficulty={setAskLevel}
+      onStart={startPicked}
+      onCancel={closeAsk}
+      busy={callingKey === asked.key}
+    />
+  ) : noProfile ? (
     <Notice
       tone="warn"
       text="The copilot does not know what you sell yet, so it cannot write your lines. Fill that in once and come back here."
@@ -738,10 +814,10 @@ export default function LeadsPage() {
               onBucket={setBucket}
               onPhoneOnly={setPhoneOnly}
               onSort={setSort}
-              onCall={callLead}
+              onCall={askLead}
               onOpen={openDetail}
               callingKey={callingKey}
-              noticeKey={failKey}
+              noticeKey={askKey ?? failKey}
               notice={rowNotice}
             />
           ) : null}

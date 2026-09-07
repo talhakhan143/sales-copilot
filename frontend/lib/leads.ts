@@ -30,18 +30,22 @@
  */
 
 import type {
+  CallMode,
+  Difficulty,
   LeadCallSession,
   LeadDetail,
   LeadMoney,
   LeadRow,
   LeadStatus,
   PainPoint,
+  PracticeSession,
   PreparedSession,
   ScrapeJob,
   SearchSummary,
 } from "@/lib/types";
 import {
   asLeadTrack,
+  isDifficulty,
   isLeadDetail,
   isLeadRow,
   isLeadStatus,
@@ -229,7 +233,19 @@ export type LeadListResult =
 export type LeadResult = { kind: "ok"; lead: LeadDetail } | LeadsFailure;
 
 /** What `startLeadCall` gives back. The session opens the teleprompter. */
-export type LeadCallResult = { kind: "ok"; session: LeadCallSession } | LeadsFailure;
+export type LeadCallResult =
+  | { kind: "ok"; session: LeadCallSession | LeadPracticeSession }
+  | LeadsFailure;
+
+/**
+ * A rehearsal built from a real lead.
+ *
+ * It is both things at once, which is the point: a practice session the call
+ * page opens on the practice screen, carrying the lead it was built from so the
+ * screen can say which business is being rehearsed. It is deliberately NOT
+ * treated as a lead call by the outcome row, because nobody was rung.
+ */
+export type LeadPracticeSession = LeadCallSession & PracticeSession;
 
 /** What `setLeadStatus` gives back. */
 export type LeadStatusResult =
@@ -264,6 +280,16 @@ export interface LeadCallBody {
   knowledgeBase: string;
   /** Two letter language code. Defaults to "en". */
   language?: string;
+  /**
+   * Ring the business, or rehearse against a robot playing it.
+   *
+   * Both build from the same audit. Practice changes who answers, nothing about
+   * what the copilot knows, so the rep trains on the business they are actually
+   * about to ring rather than on a made up one.
+   */
+  mode?: CallMode;
+  /** How hard the robot is. Read only when `mode` is "practice". */
+  difficulty?: Difficulty;
 }
 
 /** The body of POST /api/leads/search, which starts a new scrape. */
@@ -874,10 +900,12 @@ export async function startLeadCall(
   }
 
   const language = (body.language ?? "en").trim() || "en";
+  const mode: CallMode = body.mode === "practice" ? "practice" : "live";
+  const difficulty: Difficulty = body.difficulty ?? "normal";
 
   const answer = await request(
     leadPath(searchId, key, "/call"),
-    { method: "POST", body: JSON.stringify({ knowledgeBase, language }) },
+    { method: "POST", body: JSON.stringify({ knowledgeBase, language, mode, difficulty }) },
     CALL_TIMEOUT_MS,
     signal,
   );
@@ -899,7 +927,26 @@ export async function startLeadCall(
     ? answer.payload.leadKey
     : key.trim();
 
-  return { kind: "ok", session: { ...session, leadKey, leadName } };
+  const built: LeadCallSession = { ...session, leadKey, leadName };
+  if (mode !== "practice") return { kind: "ok", session: built };
+
+  /* The four practice fields are read leniently, the same way the setup form
+     reads them. A rehearsal that came back without a usable level or opening
+     line is still a rehearsal, and falling back beats sending the rep to a red
+     box over a field they never chose. */
+  const raw = answer.payload;
+  return {
+    kind: "ok",
+    session: {
+      ...built,
+      mode: "practice",
+      difficulty: isDifficulty(raw.difficulty) ? raw.difficulty : difficulty,
+      personaName: isStr(raw.personaName) && raw.personaName.trim().length > 0
+        ? raw.personaName.trim()
+        : null,
+      openingLine: isStr(raw.openingLine) ? raw.openingLine.trim() : "",
+    },
+  };
 }
 
 /**

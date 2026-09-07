@@ -1112,10 +1112,51 @@ class LeadCallRequest(CamelModel):
         knowledge_base: Everything the rep sells, pasted raw. Required.
         language: Two letter code the copilot must answer in. Unsupported or
             missing values fall back to ``en``.
+        mode: ``live`` to ring the business, or ``practice`` to rehearse against
+            a robot playing it. Anything else becomes ``live``, because a bad
+            word must never stand between a rep and a real call.
+        difficulty: How hard the robot is. Read only when ``mode`` is
+            ``practice``, and coerced the same way the practice route coerces
+            it, so the two doors into a rehearsal cannot drift apart.
     """
 
     knowledge_base: str = Field(min_length=1, max_length=40000)
     language: str = DEFAULT_LANGUAGE
+    mode: str = "live"
+    difficulty: str = DEFAULT_DIFFICULTY
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _normalize_mode(cls, value: object) -> str:
+        """Coerce the mode, defaulting to a real call.
+
+        Args:
+            value: Raw incoming mode value of any type.
+
+        Returns:
+            ``practice`` only when that word was actually sent, ``live``
+            otherwise. Never raises: an unreadable mode falls back to the real
+            call the rep was almost certainly asking for.
+        """
+        if not isinstance(value, str):
+            return "live"
+        return "practice" if value.strip().lower() == "practice" else "live"
+
+    @field_validator("difficulty", mode="before")
+    @classmethod
+    def _normalize_difficulty(cls, value: object) -> str:
+        """Lowercase the level and fall back to ``normal`` when unknown.
+
+        Args:
+            value: Raw incoming difficulty value of any type.
+
+        Returns:
+            One of ``warm``, ``normal`` or ``brutal``.
+        """
+        if not isinstance(value, str):
+            return DEFAULT_DIFFICULTY
+        key = value.strip().lower()
+        return key if key in PRACTICE_DIFFICULTIES else DEFAULT_DIFFICULTY
 
     @field_validator("knowledge_base", mode="after")
     @classmethod
@@ -1168,10 +1209,21 @@ class LeadCallResponse(PrepareContextResponse):
             outcome back when the call ends.
         lead_name: The business name, so the page can show who is being called
             without fetching the lead again.
+        mode: ``live`` or ``practice``. The call page reads this to decide which
+            screen to open.
+        difficulty: The level the robot plays at. Meaningless on a live call.
+        persona_name: Who the robot answers to, or ``None`` when the audit found
+            no name. Meaningless on a live call.
+        opening_line: What the robot says before the rep says anything. Empty on
+            a live call, where a real person speaks first.
     """
 
     lead_key: str = ""
     lead_name: str = ""
+    mode: str = "live"
+    difficulty: str = DEFAULT_DIFFICULTY
+    persona_name: str | None = None
+    opening_line: str = ""
 
 
 class LeadStatusRequest(CamelModel):

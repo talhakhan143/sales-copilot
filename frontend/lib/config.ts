@@ -9,6 +9,8 @@
  *     proxied through a route handler.
  */
 
+import type { Difficulty } from "@/lib/types";
+
 /** Remove one or more trailing slashes so callers can always append a path. */
 function stripTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
@@ -79,3 +81,23 @@ export const LANGUAGES: { code: string; label: string }[] = [
 
 /** How often the setup page re polls /api/health, in milliseconds. */
 export const HEALTH_POLL_MS = 15000;
+
+/**
+ * The three practice levels.
+ *
+ * These live here and not inside the setup form because a practice call can be
+ * started from two places now, that form and a lead in the calling list, and two
+ * copies of these words would eventually disagree about what "Brutal" means.
+ *
+ * The backend serves the same three from GET /api/practice/difficulties. This
+ * list is what the UI draws before that answer lands, and what it falls back to
+ * if the request fails, so the picker is never empty.
+ */
+export const DIFFICULTIES: { key: Difficulty; label: string; blurb: string }[] = [
+  { key: "warm", label: "Warm", blurb: "Friendly. They ask real questions and give you time to talk." },
+  { key: "normal", label: "Normal", blurb: "Busy and short. They push back two or three times." },
+  { key: "brutal", label: "Brutal", blurb: "They want to hang up. You get one line to keep them." },
+];
+
+/** The level used when nothing says how hard. Same default the backend uses. */
+export const DEFAULT_DIFFICULTY: Difficulty = "normal";

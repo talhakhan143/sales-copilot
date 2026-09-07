@@ -35,7 +35,7 @@ from typing import Any, Final
 
 from app.practice import FILLER_NAME, coach_prompt, persona_system_prompt
 from app.practice import PERSONA_MAX_TOKENS as _PERSONA_MAX_TOKENS
-from app.services.groq_client import GroqClient
+from app.services.groq_client import GroqClient, GroqError
 from app.services.session_store import Session
 
 logger = logging.getLogger(__name__)

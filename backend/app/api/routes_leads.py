@@ -51,6 +51,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from app.api.routes_context import get_groq
+from app.api.routes_practice import turn_into_practice
 from app.models import (
     DEFAULT_LEAD_SORT,
     DEFAULT_LEAD_STATUS,
@@ -73,6 +74,7 @@ from app.models import (
     SearchSummary,
 )
 from app.services.context_builder import prepare_context
+from app.services.session_store import store
 
 log = logging.getLogger("salescopilot.api.leads")
 
@@ -1205,19 +1207,49 @@ async def post_lead_call(
             detail=f"That prospect URL is not usable: {exc}",
         ) from exc
 
-    # The lead stops counting as money on the table the moment the call starts.
-    # The status stays whatever it was until the rep picks an outcome. A failure
-    # here is logged and swallowed, because the session is already built and
-    # sending the rep back for a bookkeeping problem would be absurd.
-    stamper = _lookup(leads_service, _MARK_CALLED)
-    if stamper is not None:
-        try:
-            await _call_io(stamper, clean_key)
-        except Exception:  # noqa: BLE001 - the call matters more than the stamp.
-            log.exception("could not stamp lead %s as called", clean_key)
+    # A rehearsal against this business is still this business: the same audit,
+    # the same notes, the same goal, and only the person on the other end is
+    # made up. So the whole build above is shared and practice is one step at
+    # the end, taken from the practice route itself rather than copied, because
+    # a persona that behaves differently depending on which door it came through
+    # would make the rehearsal worthless.
+    practice_fields: dict[str, object] = {}
+    if payload.mode == "practice":
+        session = store.get(context.session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=500,
+                detail="The practice call was lost right after it was made. Try again.",
+            )
+        practice_fields = turn_into_practice(
+            session,
+            context,
+            knowledge_base=payload.knowledge_base,
+            client_context=client_context or None,
+            call_goal=context_request.call_goal,
+            difficulty=payload.difficulty,
+        )
+    else:
+        # The lead stops counting as money on the table the moment the call
+        # starts. The status stays whatever it was until the rep picks an
+        # outcome. A failure here is logged and swallowed, because the session is
+        # already built and sending the rep back for a bookkeeping problem would
+        # be absurd.
+        #
+        # A practice run never reaches this. Nobody was rung, so counting it as
+        # a call would quietly eat the lead out of the money still on the table
+        # and out of the To call tab, which is the opposite of what rehearsing
+        # is for.
+        stamper = _lookup(leads_service, _MARK_CALLED)
+        if stamper is not None:
+            try:
+                await _call_io(stamper, clean_key)
+            except Exception:  # noqa: BLE001 - the call matters more than the stamp.
+                log.exception("could not stamp lead %s as called", clean_key)
 
     log.info(
-        "Lead call ready, session %s, lead %s (%s), site=%s",
+        "Lead %s ready, session %s, lead %s (%s), site=%s",
+        payload.mode,
         context.session_id,
         clean_key,
         detail.name or "unknown",
@@ -1229,6 +1261,7 @@ async def post_lead_call(
             **context.model_dump(by_alias=True),
             "leadKey": detail.key or clean_key,
             "leadName": detail.name,
+            **practice_fields,
         }
     )
 
