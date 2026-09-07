@@ -23,6 +23,7 @@ backend/.env is the only step to a working call.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import traceback
 from collections.abc import AsyncIterator
@@ -34,11 +35,14 @@ from fastapi.responses import JSONResponse
 
 from app.api.routes_call import router as call_router
 from app.api.routes_context import router as context_router
+from app.api.routes_leads import router as leads_router
 from app.api.routes_practice import router as practice_router
 from app.api.routes_twilio import router as twilio_router
 from app.api.routes_ws import router as ws_router
 from app.config import (
     cors_origin_list,
+    leadengine_data_path,
+    leadengine_dirs_agree,
     public_wss_base,
     settings,
     twilio_ready,
@@ -124,6 +128,51 @@ def _calling_lines() -> list[str]:
     ]
 
 
+def _scraper_ready() -> bool:
+    """Report whether a new search could actually open a browser.
+
+    The scraper drives a real Chromium through playwright. On an install that
+    was set up before the leads screen existed, the virtualenv is already there
+    and playwright was never added to it, so a new search dies one second after
+    it starts with an import error nobody sees.
+
+    ``find_spec`` is used rather than an import, so nothing heavy is loaded at
+    startup just to answer a banner line.
+
+    Returns:
+        True when the playwright package is installed in this virtualenv.
+    """
+    try:
+        return importlib.util.find_spec("playwright") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _leads_lines() -> list[str]:
+    """Describe the leads screen for the startup banner.
+
+    Two things can be quietly wrong here and both cost the rep a wasted scrape,
+    so both are said out loud at startup rather than found later.
+
+    Returns:
+        The banner lines for the leads section.
+    """
+    folder = str(leadengine_data_path())
+    if _scraper_ready():
+        search_line = "ready"
+    else:
+        search_line = "off, playwright is missing, run backend/run.sh again"
+
+    lines = [
+        f"  Lead data     : {folder}",
+        f"  New search    : {search_line}",
+    ]
+    if not leadengine_dirs_agree():
+        lines.append("  WARNING       : a new search writes into leadengine/data in this repo,")
+        lines.append("                  not the folder above, so it will not show on the screen")
+    return lines
+
+
 def _banner(origins: list[str], groq_configured: bool) -> str:
     """Build the startup banner printed to the console.
 
@@ -152,6 +201,8 @@ def _banner(origins: list[str], groq_configured: bool) -> str:
         f"  Log level     : {settings.log_level}",
         rule,
         *_calling_lines(),
+        rule,
+        *_leads_lines(),
         rule,
         "  REST      http://127.0.0.1:8000/api/health",
         "  Docs      http://127.0.0.1:8000/docs",
@@ -195,6 +246,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.warning(
             "GROQ_API_KEY is empty. Transcription and suggestions are disabled. "
             "Get a free key at https://console.groq.com/keys and put it in backend/.env"
+        )
+    if not _scraper_ready():
+        log.warning(
+            "playwright is not installed in this virtualenv, so a new lead search "
+            "will fail as soon as it starts. Run backend/run.sh again, or install "
+            "it by hand with: uv pip install --python backend/.venv/bin/python "
+            "-r backend/requirements.txt"
+        )
+    if not leadengine_dirs_agree():
+        log.warning(
+            "LEADENGINE_DATA_DIR points at %s, but a new search always writes into "
+            "the leadengine/data folder inside this repo. The leads screen will not "
+            "list a search started from this app while these two differ.",
+            leadengine_data_path(),
         )
 
     try:
@@ -241,6 +306,7 @@ app.add_middleware(
 
 app.include_router(context_router)
 app.include_router(practice_router)
+app.include_router(leads_router)
 app.include_router(call_router)
 app.include_router(twilio_router)
 app.include_router(ws_router)

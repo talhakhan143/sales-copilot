@@ -1,0 +1,95 @@
+{
+  "_comment": "Deal pricing aur scoring ke saare numbers yahan hain. Dashboard ki Settings screen se yehi file edit hogi - code kahin hard-coded nahi.",
+
+  "currency": "USD",
+  "currency_symbol": "$",
+  "ltv_months": 6,
+
+  "tiers": {
+    "A": {
+      "label": "High ticket",
+      "website_price": [2500, 5000],
+      "retainer_monthly": [1500, 3000],
+      "value_weight": 1.0,
+      "keywords": [
+        "dentist", "dental", "orthodont", "endodont", "periodont", "oral surgeon",
+        "lawyer", "attorney", "law firm", "legal",
+        "roofing", "roofer", "hvac", "heating", "air conditioning",
+        "med spa", "medspa", "plastic surgeon", "cosmetic surgery", "dermatolog",
+        "chiropract", "physical therapy", "fertility", "ivf",
+        "real estate", "realtor", "mortgage", "insurance",
+        "accountant", "cpa", "tax", "financial advisor",
+        "veterinar", "surgeon", "clinic", "hospital", "urgent care",
+        "solar", "remodel", "general contractor", "construction", "paving",
+        "rehab", "treatment center", "private school", "driving school"
+      ]
+    },
+    "B": {
+      "label": "Mid ticket",
+      "website_price": [1200, 2500],
+      "retainer_monthly": [600, 1200],
+      "value_weight": 0.7,
+      "keywords": [
+        "car wash", "detailing", "auto repair", "mechanic", "tire", "body shop",
+        "gym", "fitness", "yoga", "pilates", "martial arts", "crossfit",
+        "salon", "spa", "beauty", "nail", "lash", "aesthetic",
+        "plumb", "electric", "locksmith", "pest control", "landscap", "lawn",
+        "cleaning", "maid", "carpet", "moving", "storage",
+        "photograph", "event", "catering", "wedding", "printing",
+        "dry clean", "laundry", "appliance repair", "pool", "fence",
+        "vet", "grooming", "daycare", "tutor", "travel agency"
+      ]
+    },
+    "C": {
+      "label": "Low ticket",
+      "website_price": [600, 1200],
+      "retainer_monthly": [300, 600],
+      "value_weight": 0.45,
+      "keywords": [
+        "cafe", "coffee", "bakery", "barber", "food truck", "juice",
+        "restaurant", "pizza", "fast food", "ice cream", "dessert",
+        "convenience", "grocery", "retail", "boutique", "gift", "florist",
+        "tailor", "cobbler", "kiosk", "stationery", "book store"
+      ]
+    }
+  },
+  "default_tier": "B",
+
+  "review_bands": [
+    { "min": 0,   "max": 9,      "multiplier": 0.65, "label": "abhi shuru hua hai" },
+    { "min": 10,  "max": 49,     "multiplier": 0.85, "label": "chhota magar chal raha hai" },
+    { "min": 50,  "max": 149,    "multiplier": 1.0,  "label": "established" },
+    { "min": 150, "max": 499,    "multiplier": 1.3,  "label": "busy business" },
+    { "min": 500, "max": 99999999, "multiplier": 1.6, "label": "market leader" }
+  ],
+
+  "gap_multipliers": {
+    "no_website": 1.0,
+    "social_only": 0.95,
+    "site_down": 1.0,
+    "site_bad": 0.9,
+    "site_average": 0.75,
+    "site_good": 0.55
+  },
+
+  "seo_setup_fee_months": 1,
+  "website_maintenance_share": 0.18,
+
+  "close_probability_by_urgency": {
+    "5": 0.18,
+    "4": 0.12,
+    "3": 0.08,
+    "2": 0.05,
+    "1": 0.03
+  },
+
+  "score_weights": {
+    "revenue_signal": 30,
+    "digital_gap": 30,
+    "category_value": 20,
+    "reputation": 10,
+    "contactability": 10
+  },
+
+  "revenue_signal_full_at_reviews": 500
+}

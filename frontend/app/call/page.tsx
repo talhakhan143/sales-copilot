@@ -37,6 +37,23 @@
  *
  * In practice mode none of it is mounted. There is nobody on the other end of a
  * rehearsal, so a Call button there would be a button that cannot call.
+ *
+ * LEADS (CONTRACT_LEADS.md section 6)
+ *
+ * A call can also come from the calling list. When it does, the address bar
+ * carries the lead key and the search it belongs to, and this screen adds two
+ * things: a thin strip over the glass holding the business name, and the
+ * outcome row that asks what happened once the call is over. The outcome row
+ * takes the objection bar's own row in the grid, because the eight chips answer
+ * a client who is still on the line and there is nobody on the line any more.
+ *
+ * Picking an answer writes it straight into the lead engine's own pipeline
+ * file, and Next lead builds the context for the next uncalled lead in the same
+ * search and opens it, so a rep doing forty calls a day never walks back to the
+ * list between two of them.
+ *
+ * All of it sits behind one flag. A call the rep set up by hand has no lead key,
+ * so it renders exactly the screen it rendered before any of this existed.
  */
 
 import { Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -47,6 +64,7 @@ import { ArrowLeft, Check, Copy, ExternalLink, Plus, ScrollText, Send, X } from 
 
 import { AudioSourcePicker } from "@/components/AudioSourcePicker";
 import { CallLauncher, CallStateChip } from "@/components/CallLauncher";
+import { CallOutcome } from "@/components/CallOutcome";
 import { Debrief } from "@/components/Debrief";
 import { LatencyMeter } from "@/components/LatencyMeter";
 import { ObjectionBar } from "@/components/ObjectionBar";
@@ -58,13 +76,17 @@ import { WaveVisualizer } from "@/components/WaveVisualizer";
 import { fetchProviders, hangUp, startCall } from "@/lib/calling";
 import { useTeleprompter } from "@/lib/hooks/useTeleprompter";
 import type { CallSnapshot, StreamFlags } from "@/lib/hooks/useTeleprompter";
-import { SESSION_STORAGE_KEY, loadSession } from "@/lib/session";
+import { fetchLeads, setLeadStatus, startLeadCall } from "@/lib/leads";
+import { loadProfile } from "@/lib/profile";
+import { SESSION_STORAGE_KEY, loadSession, saveSession } from "@/lib/session";
 import { isCallProvider, isCallState, isDebrief, isDifficulty } from "@/lib/types";
 import type {
   CallProvider,
   CallProviderInfo,
   Debrief as DebriefData,
   Difficulty,
+  LeadRow,
+  LeadStatus,
   PreparedSession,
   QuickAction,
   StreamKind,
@@ -140,6 +162,34 @@ const SHORTCUT_KEYS: ReadonlySet<string> = new Set([
   "c",
   "r",
 ]);
+
+/**
+ * The two keys the outcome row takes off the rest of the page.
+ *
+ * The digits are not in here on purpose. The outcome row wants 1 to 4 for
+ * itself, and it gets them, because it stands in the objection bar's row while
+ * it is open and the bar is not mounted at all. That leaves c and r, which would
+ * copy a line the rep has stopped reading and ask for a rewrite of a call that
+ * is already finished.
+ */
+const OUTCOME_SHIELD_KEYS: ReadonlySet<string> = new Set(["c", "r"]);
+
+/**
+ * Where the calling list lives.
+ *
+ * It is the way back when a search has no uncalled lead left in it, and it is
+ * the only link out of the outcome row.
+ */
+const LEADS_HREF = "/leads";
+
+/**
+ * The name printed on the outcome row when the business name is not known.
+ *
+ * The name is saved with the session, so this only shows up in a browser that
+ * has storage switched off. The row still has to say something, because "Call
+ * ended" with a blank beside it reads as a bug.
+ */
+const UNNAMED_LEAD = "This lead";
 
 /**
  * Same rule the shortcut owners use: a field has the keyboard, so nobody else
@@ -289,6 +339,106 @@ function readStoredClientNumber(sessionId: string): string {
   const record = parsed as Record<string, unknown>;
   if (record.sessionId !== sessionId) return "";
   return typeof record.clientPhone === "string" ? record.clientPhone.trim() : "";
+}
+
+/* ------------------------------------------------------------------ */
+/* The lead this call came from                                        */
+/* ------------------------------------------------------------------ */
+
+/** Which lead this call was built from, as the leads screen saved it. */
+interface StoredLead {
+  /** The lead engine's own feature id, the join key for everything. */
+  leadKey: string;
+  /** The business name, already in plain words. May be empty. */
+  leadName: string;
+  /** The search slug the lead belongs to, for example "barber-hoboken". */
+  searchId: string;
+}
+
+/** One trimmed string field out of a stored record, or an empty string. */
+function storedField(record: Record<string, unknown>, name: string): string {
+  const value = record[name];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/**
+ * Read the lead this call came from out of the stored session.
+ *
+ * loadSession() normalises a stored record down to the fields lib/types.ts
+ * declares and drops the rest, so these three are read from the stored JSON
+ * itself, the same way the practice flag and the client number above are read.
+ * The id is checked, because writing this call's answer onto last week's lead
+ * would put a wrong word in a file the rep's own dashboard reads.
+ *
+ * This is the fallback, not the source. The leads screen puts the lead key and
+ * the search id in the address bar when it starts the call, and the address bar
+ * wins, so the whole outcome flow still works in a browser with storage turned
+ * off. Every access is wrapped for the same reason as the two readers above:
+ * reading localStorage itself throws in a private window.
+ *
+ * TWO NAMES FOR THE SEARCH. The leads screen saves the slug as `leadSearchId`,
+ * next lead below saves it as `searchId`, and both are read here. One name would
+ * be nicer, but this screen is the only reader and a record written by the other
+ * screen must not come back with an empty search, because the whole outcome flow
+ * is behind "there is a lead key AND a search id". A missed field there is not a
+ * small bug, it is the outcome row never opening at all.
+ */
+function readStoredLead(sessionId: string): StoredLead | null {
+  if (typeof window === "undefined") return null;
+
+  let raw: string | null = null;
+  try {
+    raw = window.localStorage.getItem(SESSION_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+
+  const record = parsed as Record<string, unknown>;
+  if (record.sessionId !== sessionId) return null;
+
+  const leadKey = storedField(record, "leadKey");
+  if (leadKey.length === 0) return null;
+
+  const searchId = storedField(record, "searchId") || storedField(record, "leadSearchId");
+
+  return {
+    leadKey,
+    leadName: storedField(record, "leadName"),
+    searchId,
+  };
+}
+
+/**
+ * Has this business been rung already.
+ *
+ * This is the same test the backend calls `uncalled` and the same one the list
+ * chip "Not called yet" uses, written out here so the three cannot drift.
+ *
+ * WHY IT IS NOT `status === "new"`. Building a call stamps the call time and
+ * deliberately leaves the status alone until the rep picks an outcome, so a lead
+ * that was dialled and never graded stays on "new" for ever. Asking the server
+ * for status "new" therefore hands back businesses that were already called, and
+ * on a search where nothing has been graded yet it would hand back the same
+ * highest value business again and again. Checked against the rep's own data:
+ * car-wash-new-york has 65 leads, all of them still on "new", and 3 of them
+ * carry a call time.
+ *
+ * Both halves are tested because that is what the backend tests. A call time is
+ * what a plain dial leaves behind, and a status that has moved off "new" is what
+ * a graded call leaves behind.
+ */
+function hasBeenCalled(lead: LeadRow): boolean {
+  if (typeof lead.calledAt === "string" && lead.calledAt.trim().length > 0) return true;
+  return lead.status !== "new";
 }
 
 /**
@@ -454,6 +604,66 @@ function CallScreen() {
       : null;
   const practiceOn = sessionId !== null && (modeFromUrl === "practice" || savedPractice !== null);
   const difficulty: Difficulty = savedPractice?.difficulty ?? DEFAULT_DIFFICULTY;
+
+  /* ---------------- the lead this call came from ---------------- */
+
+  /* Storage does not exist during the prerender, so the saved half is read
+     after mount, exactly like the client number further down. */
+  const [storedLead, setStoredLead] = useState<StoredLead | null>(null);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setStoredLead(readStoredLead(sessionId));
+  }, [sessionId]);
+
+  /* Two spellings for each, for the same reason readStoredLead takes two names
+     for the search: the leads screen writes `lead` and `search`, next lead below
+     writes `leadKey` and `searchId`, and a link the rep pasted may be either.
+     Reading both costs nothing and keeps the outcome row from quietly never
+     opening on a call that really did come from the list. */
+  const urlLeadKey =
+    (searchParams?.get("leadKey")?.trim() || searchParams?.get("lead")?.trim()) ?? "";
+  const urlSearchId =
+    (searchParams?.get("searchId")?.trim() || searchParams?.get("search")?.trim()) ?? "";
+  const leadKey = urlLeadKey.length > 0 ? urlLeadKey : (storedLead?.leadKey ?? "");
+  const searchId = urlSearchId.length > 0 ? urlSearchId : (storedLead?.searchId ?? "");
+  const leadName = storedLead?.leadName ?? "";
+
+  /* A call that came out of the calling list. Every piece of the outcome flow
+     is behind this one flag, so a call the rep set up by hand renders the same
+     screen it always did. A practice call is never a lead call: there is nobody
+     on the other end to write an answer about. */
+  const isLead = !practiceOn && leadKey.length > 0 && searchId.length > 0;
+
+  /* ---------------- what happened on the call ---------------- */
+
+  /** True once the outcome row has taken the objection bar's row. */
+  const [outcomeOpen, setOutcomeOpen] = useState(false);
+  /** True once the rep has pressed End, which is what arms the strip button. */
+  const [endPressed, setEndPressed] = useState(false);
+  /** True while an answer is being written, or the next lead is being built. */
+  const [outcomeBusy, setOutcomeBusy] = useState(false);
+  /** One plain sentence about the last thing that failed, or null. */
+  const [outcomeError, setOutcomeError] = useState<string | null>(null);
+  /**
+   * The next uncalled lead in this search, or null when there is not one.
+   *
+   * The whole row is held, not just its key, because the next call needs the
+   * business phone number as well. It is the only place that number can come
+   * from: the call context the backend builds does not carry it, so a key on its
+   * own would open the next call with an empty dialler and send the rep back to
+   * the list to read the number, which is the walk this loop exists to remove.
+   */
+  const [nextRow, setNextRow] = useState<LeadRow | null>(null);
+  /** Bumped to ask for that lookup again, after an answer is written. */
+  const [lookupTick, setLookupTick] = useState(0);
+
+  /* Re entry guard for Next lead. It is a ref and not the busy flag above,
+     because the outcome row flushes a late note through onPick and then calls
+     onNext in the very same tick, and a state flag set by the first of those is
+     still false inside the second. */
+  const movingRef = useRef(false);
 
   const {
     status,
@@ -727,6 +937,35 @@ function CallScreen() {
     return () => window.removeEventListener("keydown", shield, true);
   }, [debriefOpen]);
 
+  /*
+   * The keyboard shield for the outcome row.
+   *
+   * The dashboard is still mounted behind it, so the teleprompter still has its
+   * window listener up, and c would copy a line the rep has stopped reading
+   * while r would ask for a rewrite of a call that is over.
+   *
+   * The digits are handled the other way round, and on purpose: the outcome row
+   * wants 1 to 4 for itself, so they are NOT swallowed here. The objection bar
+   * is not mounted at all while the row is open, which leaves the digits free to
+   * reach the row however it listens for them.
+   *
+   * Propagation is stopped, never the default action, and never while a field
+   * has the keyboard, so typing a c in the note box still types a c.
+   */
+  useEffect(() => {
+    if (!outcomeOpen) return;
+
+    function shield(event: KeyboardEvent) {
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      if (!OUTCOME_SHIELD_KEYS.has(event.key.toLowerCase())) return;
+      if (isEditable(event.target) || isEditable(document.activeElement)) return;
+      event.stopPropagation();
+    }
+
+    window.addEventListener("keydown", shield, true);
+    return () => window.removeEventListener("keydown", shield, true);
+  }, [outcomeOpen]);
+
   /* Reopen a scorecard the rep closed. A card that already arrived is just shown
      again, and one that never arrived is asked for again, so this doubles as the
      retry after a failed fetch. */
@@ -942,6 +1181,12 @@ function CallScreen() {
     setCallError(null);
     setCallNote(null);
 
+    /* The rep pressed End, so as far as they are concerned this call is over.
+       That is what arms the strip button, whatever the server then says about
+       the line itself. On a call that did not come from a lead this flag is read
+       by nothing at all. */
+    if (isLead) setEndPressed(true);
+
     void (async () => {
       const result = await hangUp(sessionId);
       if (result.kind === "error") {
@@ -953,10 +1198,192 @@ function CallScreen() {
             : "The app stopped following this call. If it is still going, end it where you started it.",
           openUrl: null,
         });
+        /* The line really is down, so this is the moment to ask what happened.
+           The row opens by itself here and only here, because pressing End is
+           the one action that means the call is finished. */
+        if (isLead) setOutcomeOpen(true);
       }
       setCallBusy(false);
     })();
-  }, [call.provider, callBusy, sessionId]);
+  }, [call.provider, callBusy, isLead, sessionId]);
+
+  /* ---------------- what happened on the call ---------------- */
+
+  const openOutcome = useCallback(() => {
+    setOutcomeOpen(true);
+    setOutcomeError(null);
+  }, []);
+
+  /* Skip means not now, so the row stands down and the eight chips come back.
+     Nothing is written and nothing is lost: the strip button is still there and
+     brings the row straight back. */
+  const skipOutcome = useCallback(() => {
+    setOutcomeOpen(false);
+    setOutcomeError(null);
+  }, []);
+
+  /**
+   * Look up the next lead in this search that has not been called.
+   *
+   * It runs when the row opens rather than when Next lead is pressed, for two
+   * reasons. The row has to know whether there IS a next lead before the rep
+   * picks anything, because that is the difference between "Press Next lead" and
+   * "That was the last lead". And doing the read while the rep is reading the
+   * four buttons takes it off the path between two calls.
+   *
+   * The lead now on the glass is skipped by key, not by its status, because a
+   * status write that failed would otherwise hand the rep the same business
+   * twice in a row.
+   *
+   * WHY THE SERVER IS NOT ASKED FOR A STATUS. It used to ask for status "new",
+   * which is not the same question as "has not been called". Building a call
+   * stamps the call time and leaves the status alone until the rep grades it, so
+   * status "new" still holds every business that was dialled and never graded,
+   * and the row would offer one of them again. The read now asks only for leads
+   * with a phone, best money first, and hasBeenCalled does the rest here, which
+   * is the same test the list chip and the backend both use.
+   */
+  useEffect(() => {
+    if (!isLead || !outcomeOpen) return;
+
+    const controller = new AbortController();
+
+    void (async () => {
+      const list = await fetchLeads(
+        searchId,
+        { hasPhone: true, sort: "value" },
+        controller.signal,
+      );
+      // An aborted read belongs to a row that has gone away.
+      if (controller.signal.aborted) return;
+
+      if (list.kind === "error") {
+        setNextRow(null);
+        setOutcomeError(withHint(list.message, list.hint));
+        return;
+      }
+
+      const row = list.leads.find((lead) => lead.key !== leadKey && !hasBeenCalled(lead));
+      setNextRow(row === undefined ? null : row);
+    })();
+
+    return () => controller.abort();
+  }, [isLead, outcomeOpen, leadKey, searchId, lookupTick]);
+
+  /**
+   * Write what happened into this lead's row.
+   *
+   * It goes to POST /api/leads/{search}/{key}/status, which lands in the same
+   * pipeline.json the rep's own lead dashboard reads, so the two can never
+   * disagree about who has been called. Nothing here throws: lib/leads.ts
+   * answers with a result either way, and a failure comes back as one plain
+   * sentence with the four buttons still live, so pressing again is the retry.
+   *
+   * A written answer also asks for the next lead lookup again. The list has just
+   * changed, and if the first lookup failed this is the moment it matters.
+   */
+  const pickOutcome = useCallback(
+    (next: LeadStatus, notes: string) => {
+      if (!isLead) return;
+
+      setOutcomeBusy(true);
+      setOutcomeError(null);
+
+      void (async () => {
+        const result = await setLeadStatus(searchId, leadKey, next, notes);
+        if (result.kind === "error") {
+          setOutcomeError(withHint(result.message, result.hint));
+          setOutcomeBusy(false);
+          return;
+        }
+        setOutcomeBusy(false);
+        setLookupTick((tick) => tick + 1);
+      })();
+    },
+    [isLead, leadKey, searchId],
+  );
+
+  /**
+   * Build the next lead's call and open it.
+   *
+   * WHY A WHOLE PAGE LOAD. Changing the address bar in place would keep this
+   * component mounted, and the hook only tears the socket and the microphones
+   * down on a new session id, not the transcript and not the line on the glass.
+   * The rep would start the next call reading the last one's answer. A real
+   * navigation gives them an empty screen with the new context behind it, which
+   * is what "the next lead" has to mean. The busy flag is deliberately left on:
+   * the page is leaving, and a second press in that gap would build a context
+   * for a call nobody is going to make.
+   */
+  const nextLead = useCallback(() => {
+    if (!isLead || movingRef.current) return;
+
+    const row = nextRow;
+    if (row === null) {
+      setOutcomeError("There is no other lead to call in this search right now.");
+      return;
+    }
+
+    movingRef.current = true;
+    setOutcomeBusy(true);
+    setOutcomeError(null);
+
+    void (async () => {
+      /* The same knowledge base the setup page saved, which is what the leads
+         screen sent for this call too. lib/leads.ts refuses an empty one with a
+         sentence saying where to fill it in, so there is nothing to check
+         here. */
+      const profile = loadProfile();
+      const built = await startLeadCall(searchId, row.key, {
+        knowledgeBase: profile?.knowledgeBase ?? "",
+        language: stored?.language ?? profile?.language ?? "en",
+      });
+
+      if (built.kind === "error") {
+        setOutcomeError(withHint(built.message, built.hint));
+        setOutcomeBusy(false);
+        movingRef.current = false;
+        return;
+      }
+
+      /* Saved with three things beside the session itself.
+
+         The search id, so a rep who reloads the next call still gets the outcome
+         row with nothing in the address bar. The same slug goes in under the
+         leads screen's own name as well, so one record reads the same whichever
+         screen wrote it.
+
+         And the business phone number, which is the field this used to drop. The
+         call context the backend builds does not carry a number, so if it is not
+         put here the dialler on the next screen opens empty and the rep has to
+         walk back to the list to read it. That walk is the one thing the loop
+         exists to remove, and without this line it happened on every call from
+         the second one on. It is written exactly the way the leads screen writes
+         it, trimmed, or null when the row has no number. */
+      const phone = typeof row.phone === "string" ? row.phone.trim() : "";
+      const record: PreparedSession &
+        StoredLead & { clientPhone: string | null; leadSearchId: string } = {
+        ...built.session,
+        searchId,
+        leadSearchId: searchId,
+        clientPhone: phone.length > 0 ? phone : null,
+      };
+      saveSession(record);
+
+      const url =
+        `/call?session=${encodeURIComponent(built.session.sessionId)}` +
+        `&leadKey=${encodeURIComponent(built.session.leadKey)}` +
+        `&searchId=${encodeURIComponent(searchId)}`;
+
+      /* A real navigation, not router.push, and the rule below is turned off
+         on purpose. A soft push keeps this component mounted, and everything it
+         is holding, the log, the line on the glass, the call receipt, the
+         number in the dialler, would carry over onto a different business. The
+         page load is the cheap and total way to be sure none of it does. */
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+      window.location.assign(url);
+    })();
+  }, [isLead, nextRow, searchId, stored?.language]);
 
   /* ---------------- derived ---------------- */
 
@@ -1022,6 +1449,16 @@ function CallScreen() {
     !practiceOn &&
     callNote === null;
   const sessionGone = status === "error" && SESSION_GONE.test(error ?? "");
+
+  /* When the outcome row is worth offering.
+     The rep pressed End, or the copilot has written at least one line, which is
+     the proof that a call really happened. Before either of those the lead strip
+     holds only the business name and carries no button at all. */
+  const outcomeArmed = isLead && (endPressed || suggestion.trim().length > 0);
+
+  /* The row stands in the objection bar's row in the grid, so it is only ever
+     drawn on a lead call that is over. */
+  const outcomeShown = isLead && outcomeOpen;
   const actions = quickActions.length > 0 ? quickActions : FALLBACK_ACTIONS;
   const shortId = useMemo(
     () => (sessionId ? sessionId.replace(/-/g, "").slice(0, 4).toUpperCase() : ""),
@@ -1317,6 +1754,47 @@ function CallScreen() {
           </div>
         ) : null}
 
+        {/* The lead strip, the same one row shape the practice strip above uses,
+            in the same place. It says which business is on the line, which a rep
+            forty calls into a day genuinely needs, and it is where the outcome
+            row is asked for once there is something to say. It settles before
+            the first line ever lands, and its one button slot never changes
+            height, so the glass under it cannot move while somebody is
+            reading. */}
+        {isLead ? (
+          <div className="flex h-8 shrink-0 items-center justify-between gap-3 border-b border-line px-[var(--tp-pad-x)]">
+            <span className="flex min-w-0 items-center gap-2">
+              <span className="h-1.5 w-1.5 shrink-0 bg-dim" aria-hidden="true" />
+              <span className="truncate font-mono text-micro uppercase text-muted">
+                {leadName.length > 0 ? `LEAD, ${leadName}` : "FROM YOUR LEAD LIST"}
+              </span>
+            </span>
+            {/* One slot, and only ever one thing in it. Before the row is open
+                it asks for the row. While the row is open it is the door out,
+                which is what a rep needs when this search has no uncalled lead
+                left and Next lead is dead. It is muted, not accent, so it never
+                competes with Next lead in the row below. */}
+            {outcomeOpen ? (
+              <Link
+                href={LEADS_HREF}
+                className="flex h-[22px] shrink-0 items-center gap-1.5 rounded-hair border border-line-strong px-2 font-mono text-micro uppercase text-muted transition-colors duration-[120ms] hover:bg-surface-2 hover:text-text"
+              >
+                <ArrowLeft className="h-3 w-3" aria-hidden="true" />
+                BACK TO THE LIST
+              </Link>
+            ) : outcomeArmed ? (
+              <button
+                type="button"
+                onClick={openOutcome}
+                title="The call is over, say how it went"
+                className="flex h-[22px] shrink-0 items-center rounded-hair border border-line-strong px-2 font-mono text-micro uppercase text-accent transition-colors duration-[120ms] hover:bg-surface-2"
+              >
+                SAY WHAT HAPPENED
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+
         <Teleprompter
           text={suggestion}
           streaming={streaming}
@@ -1378,16 +1856,37 @@ function CallScreen() {
         />
       </div>
 
-      {/* The second half of the shield above, and the honest one: while the
-          score card is up the chips are not usable, so they are drawn as not
-          usable and their own digit guard turns the key down as well. */}
+      {/* One row, two jobs, never both at once.
+
+          While the call is live it is the objection matrix. Once a lead call is
+          over the outcome row stands in its place, because the eight chips
+          answer a client who is still on the line and there is nobody on the
+          line any more. Swapping them rather than stacking them is also what
+          keeps the grid at four rows and the page unable to scroll.
+
+          The second half of the score card shield lives here too, and it is the
+          honest one: while the card is up the chips are not usable, so they are
+          drawn as not usable and their own digit guard turns the key down as
+          well. */}
       <div style={{ gridArea: "chips" }} className="min-h-0 min-w-0">
-        <ObjectionBar
-          actions={actions}
-          disabled={!socketOpen || debriefOpen}
-          activeKey={activeKey}
-          onFire={fireAction}
-        />
+        {outcomeShown ? (
+          <CallOutcome
+            leadName={leadName.length > 0 ? leadName : UNNAMED_LEAD}
+            saving={outcomeBusy}
+            error={outcomeError}
+            hasNext={nextRow !== null}
+            onPick={pickOutcome}
+            onNext={nextLead}
+            onSkip={skipOutcome}
+          />
+        ) : (
+          <ObjectionBar
+            actions={actions}
+            disabled={!socketOpen || debriefOpen}
+            activeKey={activeKey}
+            onFire={fireAction}
+          />
+        )}
       </div>
 
       {logOpen ? (

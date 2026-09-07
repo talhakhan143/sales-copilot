@@ -284,6 +284,241 @@ export interface CallStartResult {
 }
 
 /* ------------------------------------------------------------------ */
+/* Leads                                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Where a lead is in the rep's day.
+ *
+ * The seven frozen words from CONTRACT_LEADS.md section 3.1. They are written
+ * straight into `leadengine/data/pipeline.json`, which the rep's own lead engine
+ * dashboard reads too, so these strings are shared with a second app and must
+ * never be renamed on this side alone. Show them through `STATUS_LABELS` in
+ * lib/leads.ts, never raw: "not_interested" is a database word, not a word a
+ * person reads.
+ */
+export type LeadStatus =
+  | "new"
+  | "interested"
+  | "callback"
+  | "not_interested"
+  | "no_answer"
+  | "won"
+  | "lost";
+
+/**
+ * What the rep would sell this business.
+ *
+ * The lead engine writes the word in capitals, "SEO" or "WEBSITE", and that is
+ * what the 91 real leads on disk carry today. `OTHER` is not a track the engine
+ * produces, it is the safe landing spot for a word this build does not know, so
+ * one strange row cannot make a lead vanish from a calling list. Map it through
+ * `TRACK_LABELS` in lib/leads.ts before it reaches the screen.
+ */
+export type LeadTrack = "SEO" | "WEBSITE" | "OTHER";
+
+/**
+ * How bad one audit finding is.
+ *
+ * Four words, not two. The contract only sends high and medium into the call
+ * context, but the audit files on disk also hold `critical` and `low`, and the
+ * lead drawer shows the whole list, so all four have to be nameable here.
+ */
+export type PainSeverity = "critical" | "high" | "medium" | "low";
+
+/**
+ * One finished search, from GET /api/leads/searches.
+ *
+ * `value` is the money still on the table: the deal value of every lead in this
+ * search that has not been called yet. It drops as the rep works the list, which
+ * is the point.
+ */
+export interface SearchSummary {
+  /** The slug the files are named after, for example "barber-hoboken". */
+  id: string;
+  niche: string;
+  location: string;
+  /** How many leads the search found. */
+  leads: number;
+  /** How many of them have been called. */
+  called: number;
+  /** Sum of the deal value over the leads not called yet. */
+  value: number;
+  /** The symbol to put in front of `value`, for example "$". */
+  currency: string;
+  /** Epoch seconds, as a float. Newest search first in the list. */
+  scrapedAt: number;
+}
+
+/**
+ * One row in the calling list, from GET /api/leads/{search_id}.
+ *
+ * `phone` and `website` are a string, an empty string, or null, because a lead
+ * with no number and a lead with no site are both normal and both meaningful. An
+ * empty phone means the row cannot be called, so use `canCall` in lib/leads.ts
+ * rather than testing the field by hand in three components.
+ *
+ * `rating` and `reviews` are 0 for a business Google has no stars for yet. That
+ * is 2 of the 91 leads on disk, so it is a real case, not a theory. The scraper
+ * stores null for those, and lib/leads.ts folds a null to 0 before the guard
+ * runs, so a business with no stars is never dropped from a calling list and no
+ * component has to hold a null. Test `rating > 0`, never `rating != null`.
+ */
+export interface LeadRow {
+  /** The join key, the same value the lead engine calls `feature_id`. */
+  key: string;
+  name: string;
+  category: string;
+  city: string;
+  phone: string | null;
+  website: string | null;
+  /** 0 to 5. Exactly 0 means Google has no stars for this business yet. */
+  rating: number;
+  /** 0 or more. 0 means nobody has left a review yet. */
+  reviews: number;
+  track: LeadTrack;
+  /** 0 to 100. How good this lead is overall. */
+  leadScore: number;
+  /** 1 to 5. How much of a hurry they are in. */
+  urgency: number;
+  /** One plain line saying why this lead is worth a call. */
+  why: string;
+  /** What the work is worth, in the currency below. */
+  dealValue: number;
+  /** The symbol to put in front of `dealValue`, for example "$". */
+  currency: string;
+  /** How many things the audit found wrong. */
+  painCount: number;
+  status: LeadStatus;
+  /** ISO timestamp of the first call, or null when never called. */
+  calledAt: string | null;
+}
+
+/**
+ * One thing the audit found wrong, with the evidence.
+ *
+ * `proof` is the number the rep says out loud, for example "6.6s". It is often
+ * an empty string, and an empty one must be left out of the screen rather than
+ * drawn as an empty bracket.
+ */
+export interface PainPoint {
+  title: string;
+  detail: string;
+  proof: string;
+  severity: PainSeverity;
+}
+
+/** One line of opening hours, exactly as Google Maps showed it. */
+export interface OpeningHours {
+  /** For example "Wednesday". */
+  day: string;
+  /** For example "9 AM to 8:15 PM", or "Closed". */
+  hours: string;
+}
+
+/**
+ * What this lead is worth, from the lead engine's own scoring.
+ *
+ * All seven fields are always sent, and every one of the 91 scored leads on disk
+ * has all of them. So a half filled block means the backend is broken, not that
+ * the business is unusual, and the guard below rejects the lead instead of
+ * drawing a blank price.
+ *
+ * A search that has been scraped but not scored yet has no prices worked out. It
+ * still gets a whole block, with a zero in every number and an empty string in
+ * every word, because that is a shape the screen can read, and the drawer
+ * already leaves out any money line whose number is zero. So the rep sees no
+ * price at all, which is the honest answer, instead of a price nobody worked
+ * out. lib/leads.ts fills the same block in if the block is ever missing, so
+ * this shape holds even against an older server.
+ */
+export interface LeadMoney {
+  /** For example "Mid ticket". */
+  tierLabel: string;
+  /** The one off part of the deal. */
+  dealValueUsd: number;
+  /** The monthly part. */
+  retainerMonthlyUsd: number;
+  /** One off plus the whole retainer run. */
+  contractValueUsd: number;
+  /** For example "$". */
+  currencySymbol: string;
+  /** 0 to 1. How likely this one is to close. */
+  closeProbability: number;
+  /** Contract value times the close chance. */
+  expectedValueUsd: number;
+}
+
+/**
+ * The whole lead, from GET /api/leads/{search_id}/{key}.
+ *
+ * Everything the row has, plus the parts the drawer needs. It extends `LeadRow`
+ * on purpose: the drawer opens over a row that is already on screen, so the two
+ * shapes must never disagree about a name or a price.
+ */
+export interface LeadDetail extends LeadRow {
+  address: string;
+  hours: OpeningHours[];
+  /** The Google Maps listing, or null when the scrape did not get one. */
+  gmbUrl: string | null;
+  /** Highest severity first. May be empty when the audit has not run. */
+  painPoints: PainPoint[];
+  /** Short lines for the rep to skim before the call, never read out loud. */
+  talkingPoints: string[];
+  /**
+   * The deal maths. Never null, and never missing. A search that has not been
+   * scored yet gets a block of zeros instead, which the drawer draws as no
+   * price at all, so the drawer holds one shape and needs no null check.
+   */
+  money: LeadMoney;
+  /** Whatever the rep typed after the last call. Often an empty string. */
+  notes: string;
+}
+
+/** How a background scrape is going. */
+export type ScrapeState = "running" | "finished" | "failed";
+
+/**
+ * One background scrape, from GET /api/leads/jobs/{job_id}.
+ *
+ * `line` is the last line the job printed. It is shown as it is, because a
+ * Chromium window scrolling Google Maps for four minutes behind a spinner looks
+ * broken, and the real line ("scraped 18 of 60") looks like work.
+ */
+export interface ScrapeJob {
+  state: ScrapeState;
+  /** Which part of the pipeline is running, for example "audit". */
+  step: string;
+  /** The last line the job printed. May be an empty string at the very start. */
+  line: string;
+  /** The slug the finished search will be saved under. */
+  searchId: string;
+  /** True once the job stopped, whether it worked or failed. */
+  done: boolean;
+}
+
+/** The answer to POST /api/leads/search, which starts a scrape. */
+export interface ScrapeStarted {
+  ok: boolean;
+  searchId: string;
+  jobId: string;
+}
+
+/**
+ * A call context built from a lead, from POST /api/leads/{search_id}/{key}/call.
+ *
+ * A prepared session and nothing more, plus the two fields that say which lead
+ * it came from. It is an ordinary session: the teleprompter, the objection
+ * buttons and the calling providers all treat it exactly like one the rep built
+ * by hand. The two extra fields exist so the page can write the outcome back to
+ * the right lead when the call ends.
+ */
+export interface LeadCallSession extends PreparedSession {
+  leadKey: string;
+  leadName: string;
+}
+
+/* ------------------------------------------------------------------ */
 /* Wire frames                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -660,4 +895,195 @@ export function isDebrief(v: unknown): v is Debrief {
   if (!Array.isArray(v.fixes) || !v.fixes.every(isDebriefFix)) return false;
 
   return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Lead guards                                                         */
+/* ------------------------------------------------------------------ */
+
+/** True when `v` is one of the seven frozen pipeline words. */
+export function isLeadStatus(v: unknown): v is LeadStatus {
+  return (
+    v === "new" ||
+    v === "interested" ||
+    v === "callback" ||
+    v === "not_interested" ||
+    v === "no_answer" ||
+    v === "won" ||
+    v === "lost"
+  );
+}
+
+/** True when `v` is one of the three track words this build knows. */
+export function isLeadTrack(v: unknown): v is LeadTrack {
+  return v === "SEO" || v === "WEBSITE" || v === "OTHER";
+}
+
+/**
+ * Read the track word off the wire, in whatever case it arrives in.
+ *
+ * The lead engine writes "SEO" and "WEBSITE", the contract prose writes
+ * "Website", and both mean the same thing, so the word is upper cased before it
+ * is matched. Anything else becomes "OTHER". This never drops the lead: a
+ * business worth 850 dollars must not disappear from a calling list over one
+ * unexpected word, and the drawer can still show every pain point without
+ * knowing which of the two things is being sold.
+ */
+export function asLeadTrack(v: unknown): LeadTrack {
+  if (typeof v !== "string") return "OTHER";
+  const word = v.trim().toUpperCase();
+  if (word === "SEO") return "SEO";
+  if (word === "WEBSITE" || word === "SITE" || word === "WEB") return "WEBSITE";
+  return "OTHER";
+}
+
+function isPainSeverity(v: unknown): v is PainSeverity {
+  return v === "critical" || v === "high" || v === "medium" || v === "low";
+}
+
+/** One audit finding. `proof` is often empty, which is allowed. */
+export function isPainPoint(v: unknown): v is PainPoint {
+  return (
+    isRecord(v) &&
+    isStr(v.title) &&
+    isStr(v.detail) &&
+    isStr(v.proof) &&
+    isPainSeverity(v.severity)
+  );
+}
+
+function isOpeningHours(v: unknown): v is OpeningHours {
+  return isRecord(v) && isStr(v.day) && isStr(v.hours);
+}
+
+/**
+ * The money block, checked field by field.
+ *
+ * Nothing here is optional. A price is the one number the rep says out loud that
+ * cannot be softened later, so a half built money block is refused rather than
+ * shown with a number that was never worked out.
+ *
+ * A block of zeros is not a half built one. That is what an unscored search
+ * gets, on both sides of the wire, and it passes here on purpose: it is a whole
+ * block, it is simply worth nothing yet, and the drawer skips every money line
+ * whose number is zero.
+ */
+export function isLeadMoney(v: unknown): v is LeadMoney {
+  return (
+    isRecord(v) &&
+    isStr(v.tierLabel) &&
+    isNum(v.dealValueUsd) &&
+    isNum(v.retainerMonthlyUsd) &&
+    isNum(v.contractValueUsd) &&
+    isStr(v.currencySymbol) &&
+    isNum(v.closeProbability) &&
+    isNum(v.expectedValueUsd)
+  );
+}
+
+/**
+ * True when `v` is a complete calling list row.
+ *
+ * `track` is checked strictly and so are `rating` and `reviews`, so run the raw
+ * record through the normaliser in lib/leads.ts first. It folds the track word
+ * to one of three, and a missing star count to 0, before this ever sees it.
+ */
+export function isLeadRow(v: unknown): v is LeadRow {
+  return (
+    isRecord(v) &&
+    isStr(v.key) &&
+    v.key.length > 0 &&
+    isStr(v.name) &&
+    isStr(v.category) &&
+    isStr(v.city) &&
+    isStrOrNull(v.phone) &&
+    isStrOrNull(v.website) &&
+    isNum(v.rating) &&
+    isNum(v.reviews) &&
+    isLeadTrack(v.track) &&
+    isNum(v.leadScore) &&
+    isNum(v.urgency) &&
+    isStr(v.why) &&
+    isNum(v.dealValue) &&
+    isStr(v.currency) &&
+    isNum(v.painCount) &&
+    isLeadStatus(v.status) &&
+    isStrOrNull(v.calledAt)
+  );
+}
+
+/**
+ * True when `v` is a complete lead.
+ *
+ * Everything the row needs, plus the parts the drawer reads without a fallback.
+ * The two lists may be empty, which is the honest answer for a search whose
+ * audit has not run yet, but they must be arrays of the right shape, because a
+ * drawer that renders "undefined" next to a phone number the rep is about to
+ * dial is worse than a drawer that says the lead could not be read.
+ *
+ * The same normalising rule as `isLeadRow` applies here, for the same reason,
+ * and it covers one more field. `money` is checked in full, so a lead that
+ * arrived with no money block at all would be refused and the drawer would never
+ * open on it. The normaliser in lib/leads.ts puts a block of zeros there first,
+ * which is what the server sends for an unscored search anyway, so a search
+ * whose scoring has not run still opens.
+ */
+export function isLeadDetail(v: unknown): v is LeadDetail {
+  if (!isLeadRow(v)) return false;
+  const d = v as unknown as Record<string, unknown>;
+
+  if (!isStr(d.address)) return false;
+  if (!isStrOrNull(d.gmbUrl)) return false;
+  if (!isStr(d.notes)) return false;
+  if (!isLeadMoney(d.money)) return false;
+
+  if (!Array.isArray(d.hours) || !d.hours.every(isOpeningHours)) return false;
+  if (!Array.isArray(d.painPoints) || !d.painPoints.every(isPainPoint)) return false;
+  if (!Array.isArray(d.talkingPoints) || !d.talkingPoints.every(isStr)) return false;
+
+  return true;
+}
+
+/** True when `v` is a complete search summary row. */
+export function isSearchSummary(v: unknown): v is SearchSummary {
+  return (
+    isRecord(v) &&
+    isStr(v.id) &&
+    v.id.length > 0 &&
+    isStr(v.niche) &&
+    isStr(v.location) &&
+    isNum(v.leads) &&
+    isNum(v.called) &&
+    isNum(v.value) &&
+    isStr(v.currency) &&
+    isNum(v.scrapedAt)
+  );
+}
+
+function isScrapeState(v: unknown): v is ScrapeState {
+  return v === "running" || v === "finished" || v === "failed";
+}
+
+/** True when `v` is a complete job report. */
+export function isScrapeJob(v: unknown): v is ScrapeJob {
+  return (
+    isRecord(v) &&
+    isScrapeState(v.state) &&
+    isStr(v.step) &&
+    isStr(v.line) &&
+    isStr(v.searchId) &&
+    isBool(v.done)
+  );
+}
+
+/** True when `v` says a scrape started, with both ids the UI has to keep. */
+export function isScrapeStarted(v: unknown): v is ScrapeStarted {
+  return (
+    isRecord(v) &&
+    isBool(v.ok) &&
+    isStr(v.searchId) &&
+    v.searchId.length > 0 &&
+    isStr(v.jobId) &&
+    v.jobId.length > 0
+  );
 }

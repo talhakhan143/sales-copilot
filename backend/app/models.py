@@ -74,6 +74,64 @@ number into real E.164 is ``app.telephony.normalise_e164``, not this module, so
 there is exactly one place that decides what a good number looks like.
 """
 
+LEAD_STATUSES: frozenset[str] = frozenset(
+    {"new", "interested", "callback", "not_interested", "no_answer", "won", "lost"}
+)
+"""Every state a lead is allowed to be in, frozen by the leads contract, 3.1.
+
+These exact words are written into ``leadengine/data/pipeline.json``, which the
+rep's own lead dashboard reads as well. A new word here would show up there as
+an unknown status, so the list is closed and a value outside it falls back to
+``new`` rather than travelling on.
+"""
+
+DEFAULT_LEAD_STATUS: str = "new"
+"""Status of a lead nobody has touched yet, and the fallback for a bad value."""
+
+LEAD_SORTS: frozenset[str] = frozenset({"value", "score", "name"})
+"""How the leads list may be ordered. Money first is the default."""
+
+DEFAULT_LEAD_SORT: str = "value"
+"""Order used when the client asks for nothing, or asks for an order we do not have."""
+
+MAX_SEARCH_ID_CHARS: int = 80
+"""Longest search slug. The lead engine cuts its own slug at exactly 80 characters."""
+
+MAX_LEAD_KEY_CHARS: int = 200
+"""Longest lead key. A real one is two hex ids and a colon, about 40 characters."""
+
+MAX_LEAD_NOTES_CHARS: int = 2000
+"""Longest note the rep may store against a lead."""
+
+MAX_NICHE_CHARS: int = 80
+"""Longest niche text for a new search, for example ``barber``."""
+
+MAX_LOCATION_CHARS: int = 80
+"""Longest location text for a new search, for example ``hoboken``."""
+
+DEFAULT_SCRAPE_LIMIT: int = 60
+"""How many listings a new search reads when the client asks for no number."""
+
+MIN_SCRAPE_LIMIT: int = 1
+"""Smallest useful search. Zero would open a browser and read nothing."""
+
+MAX_SCRAPE_LIMIT: int = 400
+"""Biggest search we will start, matching the lead engine's own safety cap."""
+
+DEFAULT_SCRAPE_COUNTRY: str = "us"
+"""Country code used when the client sends none. Two letters, lower case."""
+
+JOB_STATES: frozenset[str] = frozenset({"running", "finished", "failed"})
+"""The three states a background scrape job can be in."""
+
+DEFAULT_JOB_STATE: str = "running"
+"""State used when a job reports a word we do not know.
+
+Falling back to ``running`` and not to ``failed`` is on purpose. A scrape takes
+minutes, and telling the rep it failed while a Chromium window is still open and
+working would send them to start a second one.
+"""
+
 
 class CamelModel(BaseModel):
     """Base model that speaks camelCase on the wire and snake_case in Python.
@@ -136,14 +194,20 @@ class PrepareContextRequest(CamelModel):
             raise ValueError("knowledgeBase must contain more than whitespace")
         return cleaned
 
-    @field_validator("client_url", "client_context", "call_goal", mode="before")
+    @field_validator("client_url", "call_goal", mode="before")
     @classmethod
     def _blank_to_none(cls, value: object) -> object:
-        """Strip optional text fields and turn an empty result into ``None``.
+        """Strip the short optional text fields and turn an empty result into ``None``.
 
         Over long values are truncated rather than rejected, because the browser
         form does not validate length and a 422 there would be a dead end for
         the user.
+
+        ``client_context`` is deliberately not in this list. It is the long
+        field, it holds the whole lead block, and it has its own cleaner below
+        with its own much larger cap. Pydantic runs before validators in reverse
+        order, so listing it here would let this small cap run last and quietly
+        cut the lead block in half, mid word.
 
         Args:
             value: Raw incoming value, usually a string or ``None``.
@@ -160,24 +224,34 @@ class PrepareContextRequest(CamelModel):
         cleaned = value.strip()
         if not cleaned:
             return None
-        # The shared cap here is the URL cap, which is the smallest of the
-        # three. client_context gets its own, much larger cap below.
+        # The URL cap is the shared clamp for both fields here. The call goal is
+        # cut again, much shorter, by _cap_call_goal after this.
         return cleaned[:MAX_CLIENT_URL_CHARS] if len(cleaned) > MAX_CLIENT_URL_CHARS else cleaned
 
     @field_validator("client_context", mode="before")
     @classmethod
     def _clean_client_context(cls, value: object) -> object:
-        """Strip the free text client notes and cap them.
+        """Strip the free text client notes, blank them to ``None``, and cap them.
 
-        This runs before the shared ``_blank_to_none`` validator would clip it to
-        the URL length, so the cap that actually applies is this one.
+        This is the only validator on ``client_context``, on purpose. It does
+        the whole job, the strip, the empty check and the cap, so no second
+        validator can run after it with a smaller cap.
+
+        The cap is :data:`MAX_CLIENT_CONTEXT_CHARS`, which is far above the 4000
+        characters the lead context builder is allowed to produce. That is what
+        keeps the builder's own cut, which lands on a heading boundary, the only
+        cut that ever happens to a lead block.
 
         Args:
             value: Raw incoming value, usually a string or ``None``.
 
         Returns:
-            ``None`` for empty input, otherwise the stripped and capped text.
+            ``None`` for empty input, otherwise the stripped and capped text,
+            or the untouched value when it is not a string so pydantic can
+            report the real type error.
         """
+        if value is None:
+            return None
         if not isinstance(value, str):
             return value
         cleaned = value.strip()
@@ -809,6 +883,501 @@ class CallStatusResponse(CamelModel):
         return key if key in CALL_STATES else DEFAULT_CALL_STATE
 
 
+# ====================================================================== #
+# leads
+#
+# The lead engine writes plain JSON files and ``app.services.leads`` turns them
+# into these shapes. Every field has a default, because a search that has been
+# scraped but not yet audited is normal, not an error: the ndjson is there, the
+# scores file is not, and the leads list must still draw. So a missing value is
+# an empty string, a zero or ``None``, never a 500.
+# ====================================================================== #
+
+
+def _lead_status(value: object) -> str:
+    """Coerce anything into one of the seven lead statuses.
+
+    Args:
+        value: Raw status value of any type.
+
+    Returns:
+        One of :data:`LEAD_STATUSES`, or ``new`` when the value is missing,
+        wrongly typed or a word we do not know.
+    """
+    if not isinstance(value, str):
+        return DEFAULT_LEAD_STATUS
+    key = value.strip().lower().replace(" ", "_").replace("-", "_")
+    return key if key in LEAD_STATUSES else DEFAULT_LEAD_STATUS
+
+
+class SearchSummary(CamelModel):
+    """One finished search, as shown in the search picker.
+
+    Attributes:
+        id: The search slug, for example ``barber-hoboken``. It is the file name
+            prefix of every file this search wrote, and the id used in the URLs.
+        niche: What was searched for, for example ``barber``.
+        location: Where it was searched, for example ``hoboken``.
+        leads: How many businesses this search found.
+        called: How many of them the rep has already worked, counted from the
+            pipeline file.
+        value: The money still on the table, the sum of the deal value over the
+            leads that have not been called yet. Whole units, no cents.
+        currency: The symbol to print in front of ``value``, for example ``$``.
+        scraped_at: When the search ran, as a unix timestamp in seconds, or
+            ``None`` when the files carry no date.
+    """
+
+    id: str
+    niche: str = ""
+    location: str = ""
+    leads: int = 0
+    called: int = 0
+    value: int = 0
+    currency: str = "$"
+    scraped_at: float | None = None
+
+
+class SearchesResponse(CamelModel):
+    """Result of ``GET /api/leads/searches``.
+
+    Attributes:
+        searches: Every search on disk, newest first. An empty list is a normal
+            answer on a fresh install and the screen shows the empty state.
+    """
+
+    searches: list[SearchSummary] = Field(default_factory=list)
+
+
+class LeadRow(CamelModel):
+    """One business in the calling list.
+
+    This is the shape the list draws, and :class:`LeadDetail` extends it, so the
+    row and the drawer can never disagree about a name, a score or a price.
+
+    Attributes:
+        key: The lead key, which is the Google feature id. It joins the raw
+            file, the audit file, the scores file and the pipeline file.
+        name: The business name.
+        category: What Google calls them, for example ``Hair salon``.
+        city: The city the search ran in.
+        phone: Their number, or ``None`` when the listing had none. A lead with
+            no number is still a lead, the rep may find the number another way,
+            so this is never a reason to hide it.
+        website: Their site, or ``None`` when they have none at all. Having no
+            site is the strongest thing to sell against, not missing data.
+        rating: Their Google star rating, or ``None`` when they have no reviews.
+        reviews: How many reviews that rating is built on.
+        track: ``SEO`` for a business that already has a site, ``Website`` for
+            one that does not.
+        lead_score: How good this lead is, 0 to 100.
+        urgency: How badly they need help right now, 0 to 5.
+        why: One plain line saying why to call them, taken from the audit.
+        deal_value: What the job is worth, in whole units of ``currency``.
+        currency: The symbol to print in front of ``deal_value``.
+        pain_count: How many problems the audit found on their site and listing.
+        status: Where this lead is in the pipeline, one of :data:`LEAD_STATUSES`.
+        called_at: When the rep last called, as an ISO 8601 string, or ``None``.
+    """
+
+    key: str
+    name: str = ""
+    category: str = ""
+    city: str = ""
+    phone: str | None = None
+    website: str | None = None
+    rating: float | None = None
+    reviews: int = 0
+    track: str = ""
+    lead_score: int = 0
+    urgency: int = 0
+    why: str = ""
+    deal_value: int = 0
+    currency: str = "$"
+    pain_count: int = 0
+    status: str = DEFAULT_LEAD_STATUS
+    called_at: str | None = None
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_status(cls, value: object) -> str:
+        """Keep the status inside the seven frozen words.
+
+        The pipeline file is edited by the rep's own dashboard as well as by
+        this app, so a word this app has never heard of can appear in it at any
+        time. A lead the list refuses to draw is worse than a lead drawn as new.
+
+        Args:
+            value: Raw status value of any type.
+
+        Returns:
+            One of :data:`LEAD_STATUSES`.
+        """
+        return _lead_status(value)
+
+
+class LeadsResponse(CamelModel):
+    """Result of ``GET /api/leads/{search_id}``.
+
+    Attributes:
+        search_id: The search these leads belong to, echoed back.
+        leads: The leads, already filtered and already sorted by the server, so
+            the browser draws the list in the order it is given.
+    """
+
+    search_id: str
+    leads: list[LeadRow] = Field(default_factory=list)
+
+
+class PainPointModel(CamelModel):
+    """One checked problem with the prospect's online presence.
+
+    Attributes:
+        title: The problem in a few words, for example ``The site is very slow``.
+        detail: One or two plain sentences saying why it costs them customers.
+        proof: The measured fact behind it, for example ``6.6s``. Kept exactly as
+            the audit wrote it, because this is the number the rep says out loud
+            and it has to match what was actually found. Empty when the finding
+            has no number.
+        severity: ``high``, ``medium`` or ``low``.
+    """
+
+    title: str = ""
+    detail: str = ""
+    proof: str = ""
+    severity: str = ""
+
+
+class MoneyModel(CamelModel):
+    """What this deal is worth, as the lead engine worked it out.
+
+    Attributes:
+        tier_label: Plain name of the price band, for example ``Mid ticket``.
+        deal_value_usd: The headline value of the job.
+        retainer_monthly_usd: What they would pay every month, zero for one off
+            work.
+        contract_value_usd: The whole contract, the first job plus the months.
+        currency_symbol: The symbol to print, for example ``$``.
+        close_probability: How likely this closes, 0.0 to 1.0.
+        expected_value_usd: The deal value multiplied by that probability.
+    """
+
+    tier_label: str = ""
+    deal_value_usd: int = 0
+    retainer_monthly_usd: int = 0
+    contract_value_usd: int = 0
+    currency_symbol: str = "$"
+    close_probability: float = 0.0
+    expected_value_usd: int = 0
+
+
+class LeadDetail(LeadRow):
+    """Everything known about one lead, for the drawer and for the call.
+
+    Attributes:
+        pain_points: Every problem the audit found, worst first.
+        talking_points: Short lines for the rep to skim before dialling. They are
+            notes to self, not a script, so they are shown but never spoken.
+        address: The street address from the listing.
+        hours: Opening hours, one entry per day, each with a ``day`` key and an
+            ``hours`` key. Both values are plain strings, so a listing with no
+            hours is an empty list rather than a null inside a row.
+        gmb_url: Link to their Google listing, or ``None``.
+        money: The deal maths. Always an object, never ``None``. A search whose
+            audit has not run yet gets an all zero block, which is what the lead
+            service already produces, and the screen reads a zero price as no
+            price. A null here would make the whole lead unreadable to the
+            browser, which checks every money field before it draws the drawer.
+        notes: Whatever the rep typed against this lead in the pipeline file.
+    """
+
+    pain_points: list[PainPointModel] = Field(default_factory=list)
+    talking_points: list[str] = Field(default_factory=list)
+    address: str = ""
+    hours: list[dict[str, str]] = Field(default_factory=list)
+    gmb_url: str | None = None
+    money: MoneyModel = Field(default_factory=MoneyModel)
+    notes: str = ""
+
+
+class LeadCallRequest(CamelModel):
+    """Body of ``POST /api/leads/{search_id}/{key}/call``.
+
+    Only two fields, and that is the whole point of the merge. Everything else a
+    call context needs, the prospect URL, the notes about them and the goal, is
+    built on the server out of what the audit already found, so the rep types
+    nothing between picking a lead and talking.
+
+    Attributes:
+        knowledge_base: Everything the rep sells, pasted raw. Required.
+        language: Two letter code the copilot must answer in. Unsupported or
+            missing values fall back to ``en``.
+    """
+
+    knowledge_base: str = Field(min_length=1, max_length=40000)
+    language: str = DEFAULT_LANGUAGE
+
+    @field_validator("knowledge_base", mode="after")
+    @classmethod
+    def _clean_knowledge_base(cls, value: str) -> str:
+        """Strip the knowledge base and refuse a whitespace only body.
+
+        Args:
+            value: The raw knowledge base text after length validation.
+
+        Returns:
+            The stripped text.
+
+        Raises:
+            ValueError: When nothing but whitespace was sent, which FastAPI
+                turns into a 422 response.
+        """
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("knowledgeBase must contain more than whitespace")
+        return cleaned
+
+    @field_validator("language", mode="before")
+    @classmethod
+    def _normalize_language(cls, value: object) -> str:
+        """Lowercase the language code and fall back to English when unknown.
+
+        Args:
+            value: Raw incoming language value of any type.
+
+        Returns:
+            One of the supported codes.
+        """
+        if not isinstance(value, str):
+            return DEFAULT_LANGUAGE
+        code = value.strip().lower()
+        return code if code in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+
+
+class LeadCallResponse(PrepareContextResponse):
+    """Result of starting a call from a lead.
+
+    It is a prepare context response with two extra fields and nothing else, on
+    purpose. The call page opens this session exactly the way it opens a session
+    the rep built by hand, so the teleprompter, the objection buttons, the
+    reading style switch and all four calling providers work with no special
+    casing anywhere.
+
+    Attributes:
+        lead_key: The lead this call was built from, so the page can write the
+            outcome back when the call ends.
+        lead_name: The business name, so the page can show who is being called
+            without fetching the lead again.
+    """
+
+    lead_key: str = ""
+    lead_name: str = ""
+
+
+class LeadStatusRequest(CamelModel):
+    """Body of ``POST /api/leads/{search_id}/{key}/status``.
+
+    Attributes:
+        status: What happened, one of :data:`LEAD_STATUSES`. An unknown word
+            becomes ``new`` instead of a 422, because a rep who just finished a
+            call must never be blocked from recording it.
+        notes: Anything the rep typed about the call. An empty string means the
+            rep cleared the box, and that clears the stored note. ``None``, or
+            leaving the field out, means do not touch the stored note.
+    """
+
+    status: str = DEFAULT_LEAD_STATUS
+    notes: str | None = None
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_status(cls, value: object) -> str:
+        """Coerce the status into one of the seven frozen words.
+
+        Args:
+            value: Raw status value of any type.
+
+        Returns:
+            One of :data:`LEAD_STATUSES`.
+        """
+        return _lead_status(value)
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def _clean_notes(cls, value: object) -> object:
+        """Strip the note and cap it, keeping an empty string empty.
+
+        An empty string is kept as an empty string, it is not folded into
+        ``None``. The two mean different things to the writer: ``None`` says
+        leave the stored note alone, an empty string says the rep rubbed the
+        note out and it has to go. Folding one into the other would make a
+        cleared note come back the next time the screen is opened.
+
+        Args:
+            value: Raw incoming value, usually a string or ``None``.
+
+        Returns:
+            ``None`` when the field was not sent, the stripped and capped
+            string otherwise, or the untouched value when it is not a string so
+            pydantic can report the real type error.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        return cleaned[:MAX_LEAD_NOTES_CHARS]
+
+
+class LeadStatusResponse(CamelModel):
+    """Result of writing a lead status.
+
+    Attributes:
+        ok: Whether the pipeline file was really written.
+        status: The status that was stored, after the fallback above.
+        updated_at: When it was stored, as an ISO 8601 string.
+    """
+
+    ok: bool = True
+    status: str = DEFAULT_LEAD_STATUS
+    updated_at: str = ""
+
+
+class ScrapeRequest(CamelModel):
+    """Body of ``POST /api/leads/search``, which starts a new search.
+
+    Nothing here raises. An empty niche or location is answered by the route
+    with a plain 400 message the rep can act on, which reads far better than a
+    pydantic error blob, and a silly limit is quietly clamped.
+
+    Attributes:
+        niche: What to look for, for example ``barber``.
+        location: Where to look, for example ``hoboken``.
+        limit: How many listings to read, clamped to
+            :data:`MIN_SCRAPE_LIMIT` to :data:`MAX_SCRAPE_LIMIT`.
+        country: Two letter country code, for example ``us`` or ``pk``.
+    """
+
+    niche: str = ""
+    location: str = ""
+    limit: int = DEFAULT_SCRAPE_LIMIT
+    country: str = DEFAULT_SCRAPE_COUNTRY
+
+    @field_validator("niche", "location", mode="before")
+    @classmethod
+    def _clean_words(cls, value: object) -> str:
+        """Strip the search words and collapse inner runs of whitespace.
+
+        Args:
+            value: Raw incoming value of any type.
+
+        Returns:
+            The cleaned text, capped. A wrongly typed value becomes an empty
+            string, which the route answers with its own plain message.
+        """
+        if not isinstance(value, str):
+            return ""
+        cleaned = " ".join(value.split())
+        return cleaned[:MAX_NICHE_CHARS]
+
+    @field_validator("limit", mode="before")
+    @classmethod
+    def _clamp_limit(cls, value: object) -> int:
+        """Clamp the listing count into the range the scraper can handle.
+
+        Args:
+            value: Raw incoming value of any type.
+
+        Returns:
+            A number between :data:`MIN_SCRAPE_LIMIT` and
+            :data:`MAX_SCRAPE_LIMIT`. Anything unreadable becomes the default.
+        """
+        try:
+            number = int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return DEFAULT_SCRAPE_LIMIT
+        return max(MIN_SCRAPE_LIMIT, min(MAX_SCRAPE_LIMIT, number))
+
+    @field_validator("country", mode="before")
+    @classmethod
+    def _clean_country(cls, value: object) -> str:
+        """Keep only a real two letter country code.
+
+        Args:
+            value: Raw incoming value of any type.
+
+        Returns:
+            The lower case two letter code, or :data:`DEFAULT_SCRAPE_COUNTRY`
+            when the value is not one. The code is handed to the scraper on a
+            command line, so nothing but letters may ever get through.
+        """
+        if not isinstance(value, str):
+            return DEFAULT_SCRAPE_COUNTRY
+        code = value.strip().lower()
+        if len(code) == 2 and code.isalpha() and code.isascii():
+            return code
+        return DEFAULT_SCRAPE_COUNTRY
+
+
+class ScrapeResponse(CamelModel):
+    """Result of ``POST /api/leads/search``.
+
+    Attributes:
+        ok: Whether a job is now running for these words.
+        search_id: The slug this search will write its files under. The screen
+            selects it as soon as the job finishes.
+        job_id: The handle to poll on ``GET /api/leads/jobs/{job_id}``.
+        message: One plain line for the rep, for example that a search is
+            already running and this is the one they are watching.
+    """
+
+    ok: bool = False
+    search_id: str = ""
+    job_id: str = ""
+    message: str = ""
+
+
+class JobStatusResponse(CamelModel):
+    """Result of ``GET /api/leads/jobs/{job_id}``.
+
+    A scrape opens a real Chromium window and reads Google Maps for minutes, so
+    the screen shows what the job is doing instead of a spinner. That is the
+    whole reason ``line`` is on the wire.
+
+    Attributes:
+        state: ``running``, ``finished`` or ``failed``.
+        step: Which stage is running, for example ``scrape`` or ``audit``.
+        line: The last line the job printed, so the rep can see it working.
+        search_id: The search this job is building.
+        done: Whether the job has stopped, either way. The screen polls until
+            this is true.
+    """
+
+    state: str = DEFAULT_JOB_STATE
+    step: str = ""
+    line: str = ""
+    search_id: str = ""
+    done: bool = False
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _normalize_state(cls, value: object) -> str:
+        """Keep the job state inside the three known words.
+
+        Args:
+            value: Raw state value of any type.
+
+        Returns:
+            One of :data:`JOB_STATES`, falling back to ``running``.
+        """
+        if not isinstance(value, str):
+            return DEFAULT_JOB_STATE
+        key = value.strip().lower()
+        return key if key in JOB_STATES else DEFAULT_JOB_STATE
+
+
 __all__ = [
     "SUPPORTED_LANGUAGES",
     "DEFAULT_LANGUAGE",
@@ -824,6 +1393,21 @@ __all__ = [
     "CALL_STATES",
     "DEFAULT_CALL_STATE",
     "MAX_PHONE_CHARS",
+    "LEAD_STATUSES",
+    "DEFAULT_LEAD_STATUS",
+    "LEAD_SORTS",
+    "DEFAULT_LEAD_SORT",
+    "MAX_SEARCH_ID_CHARS",
+    "MAX_LEAD_KEY_CHARS",
+    "MAX_LEAD_NOTES_CHARS",
+    "MAX_NICHE_CHARS",
+    "MAX_LOCATION_CHARS",
+    "DEFAULT_SCRAPE_LIMIT",
+    "MIN_SCRAPE_LIMIT",
+    "MAX_SCRAPE_LIMIT",
+    "DEFAULT_SCRAPE_COUNTRY",
+    "JOB_STATES",
+    "DEFAULT_JOB_STATE",
     "CamelModel",
     "PrepareContextRequest",
     "PrepareContextResponse",
@@ -846,4 +1430,18 @@ __all__ = [
     "CallStartRequest",
     "CallStartResponse",
     "CallStatusResponse",
+    "SearchSummary",
+    "SearchesResponse",
+    "LeadRow",
+    "LeadsResponse",
+    "PainPointModel",
+    "MoneyModel",
+    "LeadDetail",
+    "LeadCallRequest",
+    "LeadCallResponse",
+    "LeadStatusRequest",
+    "LeadStatusResponse",
+    "ScrapeRequest",
+    "ScrapeResponse",
+    "JobStatusResponse",
 ]

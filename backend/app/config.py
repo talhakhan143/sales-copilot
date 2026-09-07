@@ -19,10 +19,39 @@ Typical use:
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Final
 from urllib.parse import urlsplit
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+log = logging.getLogger("salescopilot.config")
+
+
+def _repo_root() -> Path:
+    """Return the directory that holds ``backend/`` and ``leadengine/``.
+
+    Worked out from this file rather than from the working directory, because
+    the backend is started from ``backend/`` by ``run.sh``, from the repo root
+    by ``start.sh`` and from anywhere at all by an editor. A relative default
+    would point at a different, usually empty, folder in each of those cases.
+
+    Returns:
+        The repository root, which is two levels above ``app/config.py``.
+    """
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _default_leadengine_data_dir() -> str:
+    """Return the lead engine data directory that ships with the repo.
+
+    Returns:
+        The absolute path of ``leadengine/data`` as a string, so the value can
+        be overridden by a plain ``LEADENGINE_DATA_DIR`` environment variable.
+    """
+    return str(_repo_root() / "leadengine" / "data")
 
 
 class Settings(BaseSettings):
@@ -87,6 +116,24 @@ class Settings(BaseSettings):
             used only to read a local number such as ``0300 1234567``. Empty
             means a number without a country code is rejected instead of
             guessed, which is the safe behaviour.
+        leadengine_data_dir: Folder the app READS lead files from, the
+            ``<slug>.ndjson``, ``<slug>.audit.json``, ``<slug>.scores.json``,
+            ``<slug>.messages.json`` and ``pipeline.json`` files. The default is
+            the ``leadengine/data`` folder inside this repo, worked out from
+            this file, so the leads screen works with nothing set at all.
+
+            This moves the reader only. The scraper writes where its own
+            package says, which is always ``leadengine/data`` inside this repo,
+            because ``leadengine/settings.py`` builds that path from its own
+            file location and the merge is not allowed to edit it. So point this
+            somewhere else only for a folder the rep fills some other way, for
+            example their own copy of the lead engine running on its own. Do it
+            and the New search button on the leads screen still runs, but its
+            files land in the repo folder and this screen will not list them.
+            Leave it unset and the reader and the writer are the same folder.
+
+            Read it through :func:`leadengine_data_path`, never by hand, so
+            every caller gets the same folder and the same creation rule.
     """
 
     model_config = SettingsConfigDict(
@@ -134,6 +181,8 @@ class Settings(BaseSettings):
     call_webhook_secret: str = ""
 
     default_country_code: str = ""
+
+    leadengine_data_dir: str = Field(default_factory=_default_leadengine_data_dir)
 
 
 settings = Settings()
@@ -337,6 +386,69 @@ def public_http_base() -> str:
     return raw.rstrip("/")
 
 
+def leadengine_data_path() -> Path:
+    """Return the lead engine data folder, making it when it is not there yet.
+
+    Every reader of the lead files goes through here, so there is one answer to
+    "where is the data" and one place that creates the folder. A fresh clone has
+    no ``leadengine/data`` until the scraper has run once, and the leads screen
+    should show an empty list with a "start a search" message rather than an
+    error, so the folder is made on first use.
+
+    Creation is best effort. A read only disk, or a path the process may not
+    write to, is logged once at warning level and the path is still returned.
+    The readers treat a missing folder exactly like an empty one, so the screen
+    stays usable either way.
+
+    Returns:
+        The absolute path of the data folder. It may not exist if creating it
+        failed, so callers still check before they read.
+    """
+    path = Path(settings.leadengine_data_dir).expanduser()
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("Could not create the lead data folder %s, %s", path, exc)
+    return path
+
+
+def leadengine_writer_path() -> Path:
+    """Return the folder a new search writes its files into.
+
+    This one is not a setting and cannot be moved. ``leadengine/settings.py``
+    builds its data path from its own file location, and the merge is not
+    allowed to change the lead engine's own code, so the scraper always writes
+    into ``leadengine/data`` inside this repo.
+
+    It is here so the reader and the writer can be compared in one line, at
+    startup, and an operator who moved :data:`Settings.leadengine_data_dir` is
+    told that new searches will not appear on their screen instead of finding
+    out after a four minute scrape.
+
+    Returns:
+        The absolute path the scraper writes into. Nothing is created here.
+    """
+    return Path(_default_leadengine_data_dir())
+
+
+def leadengine_dirs_agree() -> bool:
+    """Report whether the folder we read is the folder a new search writes into.
+
+    Returns:
+        True when a search started from this app will show up on the leads
+        screen. False when the two paths were pointed at different folders.
+    """
+    try:
+        reader = Path(settings.leadengine_data_dir).expanduser().resolve()
+        writer = leadengine_writer_path().resolve()
+    except OSError:
+        # A path we cannot resolve, for example a broken symlink, is compared
+        # as written instead. Saying "cannot tell" is not an option here, the
+        # banner needs one word.
+        return str(settings.leadengine_data_dir).strip() == str(leadengine_writer_path())
+    return reader == writer
+
+
 def _mask(secret: str) -> str:
     """Describe a secret without ever revealing it.
 
@@ -380,6 +492,12 @@ def redacted() -> dict[str, object]:
     data["public_wss_base"] = public_wss_base()
     data["public_http_base"] = public_http_base()
     data["cors_origins_parsed"] = cors_origin_list()
+
+    # Resolved by hand rather than through leadengine_data_path, because that
+    # helper creates the folder and a debug view must never change the disk.
+    lead_dir = Path(settings.leadengine_data_dir).expanduser()
+    data["leadengine_data_dir"] = str(lead_dir)
+    data["leadengine_data_exists"] = lead_dir.is_dir()
     return data
 
 
@@ -391,5 +509,8 @@ __all__ = [
     "whatsapp_cloud_ready",
     "public_wss_base",
     "public_http_base",
+    "leadengine_data_path",
+    "leadengine_writer_path",
+    "leadengine_dirs_agree",
     "redacted",
 ]

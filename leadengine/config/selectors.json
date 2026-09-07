@@ -1,0 +1,38 @@
+{
+  "_comment": "Google Maps DOM selectors. Agar Google UI badle to SIRF ye file edit karni hai. Har key ek list hai - pehla jo mile wo use hota hai (fallback chain).",
+
+  "consent_buttons": [
+    "button[aria-label='Accept all']",
+    "form[action*='consent'] button",
+    "button:has-text('Accept all')",
+    "button:has-text('I agree')"
+  ],
+
+  "feed": "div[role='feed']",
+  "feed_end_text": ["You've reached the end of the list", "You&#39;ve reached the end of the list"],
+  "card_link": "a[href*='/maps/place/']",
+  "card_container": "div.Nv2PK",
+  "card_sponsored": "span.OSrXXb",
+
+  "card_rating": ["span.MW4etd", "span[role='img'][aria-label*='stars']"],
+  "card_reviews": ["span.UY7F9"],
+  "card_meta_rows": ["div.W4Efsd"],
+  "card_website": ["a[data-value='Website']", "a[aria-label*='Visit'][href^='http']"],
+
+  "detail_root": "div[role='main']",
+  "detail_name": ["h1.DUwDvf", "div[role='main'] h1"],
+  "detail_category": ["button.DkEaL", "button[jsaction*='category']"],
+  "detail_rating_block": ["div.F7nice"],
+  "detail_rating_aria": ["div[role='main'] span[role='img'][aria-label*='stars']"],
+  "detail_reviews_button": ["button[aria-label*='reviews']", "button[jsaction*='reviewChart']"],
+  "detail_address": "button[data-item-id='address']",
+  "detail_phone": "button[data-item-id^='phone:tel:']",
+  "detail_website": "a[data-item-id='authority']",
+  "detail_pluscode": "button[data-item-id='oloc']",
+  "detail_hours_table": ["table.eK4R0e", "div[aria-label*='Hours'] table"],
+  "detail_hours_summary": ["div[jsaction*='openhours']", "div.t39EBf"],
+  "detail_price": ["span[aria-label*='Price']", "span.mgr77e"],
+  "detail_claim_link": ["a[href*='business.google.com/create']", "a:has-text('Claim this business')"],
+  "detail_action_buttons": ["div[role='main'] a[data-item-id]", "div[role='main'] button[data-item-id]"],
+  "detail_photo_count": ["button[aria-label*='photo'] span", "div.ofKBgf"]
+}
