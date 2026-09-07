@@ -38,7 +38,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Plus, TriangleAlert, X } from "lucide-react";
+import { ArrowLeft, GraduationCap, Plus, TriangleAlert, X } from "lucide-react";
 
 import { LeadDetail } from "@/components/LeadDetail";
 import { LeadList } from "@/components/LeadList";
@@ -561,10 +561,25 @@ export default function LeadsPage() {
           <span className="h-2 w-2 shrink-0 bg-accent animate-mark" aria-hidden="true" />
           <span className="font-mono text-micro uppercase text-muted">Sales copilot</span>
         </div>
-        <Link href="/" className={MICRO_BUTTON}>
-          <ArrowLeft aria-hidden="true" className="h-3 w-3" />
-          Set up one call
-        </Link>
+        <div className="flex items-center gap-2">
+          {/* Practice lives on the setup page, and before this the only way to
+              reach it was to leave the list, scroll past the lead panel and find
+              a segmented control. A rep who spends the whole day here could not
+              find it at all, so the door is on this screen and it opens straight
+              onto practice. */}
+          <Link
+            href="/?mode=practice"
+            title="Train against a robot client before you ring a real one"
+            className={MICRO_BUTTON}
+          >
+            <GraduationCap aria-hidden="true" className="h-3 w-3" />
+            Practice call
+          </Link>
+          <Link href="/" className={MICRO_BUTTON}>
+            <ArrowLeft aria-hidden="true" className="h-3 w-3" />
+            Set up one call
+          </Link>
+        </div>
       </header>
 
       <main className="mx-auto w-full max-w-[1280px] px-6 pb-24 pt-10">

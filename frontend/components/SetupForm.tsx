@@ -461,13 +461,27 @@ export function SetupForm() {
      The old build remembered the whole session and offered to walk back into it,
      which quietly invited calling the next client with the last one's notes
      loaded. Now only the half that is genuinely yours is remembered. */
+  /* eslint-disable react-hooks/set-state-in-effect -- every setState in this
+     effect is a one time read of something that does not exist during the
+     prerender, the address bar and localStorage. Reading either one after mount
+     is the documented pattern, and a lazy initial state instead would make the
+     server and the client paint different things. */
   useEffect(() => {
+    /* "?mode=practice" opens this page already on practice, which is what the
+       Practice call link on the lead list points at. It is read here and not
+       with useSearchParams because this page is prerendered as static, and that
+       hook would drag the whole route into being rendered per request just to
+       learn one word. Read after mount, like the profile below, so the server
+       and the client never disagree about the first paint. */
+    if (window.location.search.includes("mode=practice")) {
+      setMode("practice");
+    }
+
     // localStorage does not exist during the prerender, so this cannot be a lazy
     // initial state without the server and the client disagreeing about what to
     // paint. Reading it once after mount is the pattern.
     const saved = loadProfile();
     if (saved) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setKnowledgeBase(saved.knowledgeBase);
       setLanguage(saved.language);
       setProfileWasSaved(true);
@@ -477,6 +491,7 @@ export function SetupForm() {
     }
     setProfileLoaded(true);
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   useEffect(() => {
     return () => {

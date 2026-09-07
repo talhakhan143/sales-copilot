@@ -1582,16 +1582,25 @@ function CallScreen() {
           </button>
 
           {/* The next call is a different client, so it needs its own notes.
-              This goes back to the form with what you sell still filled in and
-              the client half empty, which is the whole shape of the app.
+
+              Where it goes depends on where this call came from, because "the
+              next call" means two different things. On a lead call the next
+              business is already sitting in the list, so this goes back to the
+              list. On a call the rep typed out by hand there is no list, so it
+              goes back to the form with what you sell still filled in and the
+              client half empty.
 
               It is drawn as a bordered chip, the same as CALL and SOURCES on the
               right, because it is an action. The first version wore the dim micro
               type of the session id beside it, which reads as decoration, and a
               rep looking for it could not find it. */}
           <Link
-            href="/"
-            title="Start a call with a different client"
+            href={isLead ? LEADS_HREF : "/"}
+            title={
+              isLead
+                ? "Back to your lead list to pick the next business"
+                : "Start a call with a different client"
+            }
             className="flex h-[26px] shrink-0 items-center gap-1.5 rounded-hair border border-line-strong px-2.5 font-mono text-micro uppercase text-muted transition-colors duration-[120ms] ease-out hover:bg-surface-2 hover:text-text"
           >
             <Plus className="h-3 w-3" aria-hidden="true" />
