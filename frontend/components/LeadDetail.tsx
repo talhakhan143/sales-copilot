@@ -28,11 +28,23 @@
  * There is no motion here at all. Nothing on this panel is live.
  */
 
-import { useEffect, useRef } from "react";
-import { ExternalLink, MapPin, Phone, PhoneOff, Star, TriangleAlert, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Check,
+  Copy,
+  ExternalLink,
+  MapPin,
+  Phone,
+  PhoneOff,
+  Star,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 
-import { STATUS_LABELS, TRACK_LABELS, canCall, formatDealValue } from "@/lib/leads";
+import { STATUS_LABELS, TRACK_LABELS, canCall, formatDealValue, screenshotUrl } from "@/lib/leads";
 import type { LeadDetail as Lead, PainPoint, PainSeverity } from "@/lib/leads";
+import { MESSAGE_CHANNEL_LABELS } from "@/lib/types";
+import type { LeadMessage, LeadShotView } from "@/lib/types";
 
 export interface LeadDetailProps {
   /** The lead to show, or null while it is being read or after it failed. */
@@ -46,6 +58,14 @@ export interface LeadDetailProps {
   onCall(): void;
   /** True while this lead's call is being built. */
   calling: boolean;
+  /**
+   * Which search this lead came from.
+   *
+   * Only needed to build the screenshot URLs. The lead itself does not carry
+   * its own search, because it is joined out of four files that are all named
+   * after one.
+   */
+  searchId: string;
 }
 
 /* ============================================================
@@ -211,7 +231,15 @@ function Skeleton() {
    THE DRAWER
    ============================================================ */
 
-export function LeadDetail({ lead, loading, error, onClose, onCall, calling }: LeadDetailProps) {
+export function LeadDetail({
+  lead,
+  loading,
+  error,
+  onClose,
+  onCall,
+  calling,
+  searchId,
+}: LeadDetailProps) {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const closeRef = useRef(onClose);
 
@@ -346,6 +374,13 @@ export function LeadDetail({ lead, loading, error, onClose, onCall, calling }: L
   const reviews = lead !== null && typeof lead.reviews === "number" ? lead.reviews : 0;
   const callable = lead !== null && canCall(lead);
   const points = lead === null ? [] : strongestFirst(lead.painPoints);
+
+  /* Phone first. It is the one that sells: a rep saying "I just looked at your
+     site on my phone" is describing the thing the owner has never done. */
+  const shots: LeadShotView[] =
+    lead === null
+      ? []
+      : (["mobile", "desktop"] as const).filter((view) => lead.screenshots[view] === true);
   const website = lead !== null && typeof lead.website === "string" ? lead.website.trim() : "";
   const gmbUrl = lead !== null && typeof lead.gmbUrl === "string" ? lead.gmbUrl.trim() : "";
   const phone = lead !== null && typeof lead.phone === "string" ? lead.phone.trim() : "";
@@ -495,7 +530,70 @@ export function LeadDetail({ lead, loading, error, onClose, onCall, calling }: L
                 )}
               </section>
 
-              {/* 5. THEIR LINKS */}
+              {/* 5. WHAT TO SEND THEM */}
+              {lead.messages.length > 0 ? (
+                <section className="flex flex-col gap-2">
+                  <h3 className={SECTION_HEAD}>What to send them</h3>
+                  <p className={NOTE}>
+                    Already written from this audit. Copy one and paste it. Nothing here is sent
+                    by the app.
+                  </p>
+                  <div className="flex flex-col gap-2">
+                    {lead.messages.map((draft, index) => (
+                      <MessageCard key={`${draft.channel}-${index}`} draft={draft} />
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+
+              {/* 6. WHAT THEIR SITE LOOKS LIKE */}
+              {shots.length > 0 ? (
+                <section className="flex flex-col gap-2">
+                  <h3 className={SECTION_HEAD}>What their site looks like</h3>
+                  <p className={NOTE}>
+                    Taken when the audit ran. The phone one is the one worth looking at, that is
+                    where their customers are.
+                  </p>
+                  <div className="grid grid-cols-2 gap-2">
+                    {shots.map((view) => (
+                      <a
+                        key={view}
+                        href={screenshotUrl(searchId, lead.key, view)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={`Open the ${view} picture full size`}
+                        className="flex flex-col gap-1.5"
+                      >
+                        <span className={SECTION_HEAD}>
+                          {view === "mobile" ? "On a phone" : "On a computer"}
+                        </span>
+                        {/* Not next/image: these are served by our own API behind
+                            a path the optimiser cannot pre-resolve, and they are
+                            thumbnails of a screenshot, so the optimiser would
+                            buy nothing.
+
+                            Not lazy either, though it was at first. This panel
+                            is its own scrolling box, and inside one Chrome never
+                            fired the intersection that starts a lazy image: the
+                            section drew, the frames were the right size, and
+                            both stayed blank forever. There are two images and
+                            they are only asked for when a drawer opens, so
+                            eager costs nothing and is the only version that
+                            actually shows the rep the site. */}
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={screenshotUrl(searchId, lead.key, view)}
+                          alt={`${lead.name} on ${view === "mobile" ? "a phone" : "a computer"}`}
+                          className="w-full border border-line-strong bg-surface-2 object-cover object-top"
+                          style={{ aspectRatio: view === "mobile" ? "9 / 14" : "16 / 10" }}
+                        />
+                      </a>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+
+              {/* 7. THEIR LINKS */}
               <section className="flex flex-col gap-2">
                 <h3 className={SECTION_HEAD}>Their pages</h3>
 
@@ -614,4 +712,106 @@ export function LeadDetail({ lead, loading, error, onClose, onCall, calling }: L
       </div>
     </div>
   );
+}
+
+
+/**
+ * One ready to send message, with the one button that matters.
+ *
+ * The body is shown in full rather than clamped. A rep about to paste something
+ * to a real prospect has to be able to read all of it first, and a two line
+ * preview with a copy button is how a draft that says the wrong thing gets sent.
+ *
+ * The tick is on the button itself and clears itself after a moment. A rep
+ * copying three drafts in a row needs to know which one is on the clipboard now,
+ * not which ones they have ever copied.
+ */
+function MessageCard({ draft }: { draft: LeadMessage }) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 2000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const copy = useCallback(() => {
+    /* Subject and body together for an email, because pasting a body with no
+       subject into a mail client is half a message. */
+    const text = draft.subject ? `${draft.subject}\n\n${draft.body}` : draft.body;
+    void copyText(text).then(setCopied);
+  }, [draft]);
+
+  return (
+    <div className="flex flex-col gap-2 bg-surface-2 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <span className={SECTION_HEAD}>{MESSAGE_CHANNEL_LABELS[draft.channel]}</span>
+        <button
+          type="button"
+          onClick={copy}
+          className={`relative flex h-[22px] shrink-0 items-center gap-1.5 rounded-hair border border-line-strong px-2 font-mono text-micro uppercase transition-colors duration-[120ms] before:absolute before:-inset-y-[11px] before:-inset-x-2 before:content-[''] ${
+            copied ? "text-ok" : "text-muted hover:bg-surface hover:text-text"
+          }`}
+        >
+          {copied ? (
+            <Check aria-hidden="true" className="h-3 w-3" />
+          ) : (
+            <Copy aria-hidden="true" className="h-3 w-3" />
+          )}
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+
+      {draft.subject ? (
+        <p className="font-sans text-body text-text">{draft.subject}</p>
+      ) : null}
+      <p className="whitespace-pre-wrap font-sans text-body text-muted">{draft.body}</p>
+    </div>
+  );
+}
+
+
+/**
+ * Put text on the clipboard, by whichever route this browser actually has.
+ *
+ * `navigator.clipboard` only exists in a secure context. The rep runs this from
+ * `npm run dev`, which prints a http://192.168.x.x address alongside localhost,
+ * and opening that from a phone or a second machine is plain http. There the
+ * whole clipboard object is undefined and the modern call throws before it does
+ * anything, so every copy button on the drawer would be dead on exactly the
+ * device a rep is most likely to be holding.
+ *
+ * So: try the modern one, fall back to a hidden textarea and the old command.
+ * The textarea is positioned off screen rather than hidden, because a display
+ * of none cannot be selected and the copy silently does nothing.
+ *
+ * @returns Whether the text really made it. The button only claims success on
+ *   a true, so a failure leaves it saying "copy" instead of lying.
+ */
+async function copyText(text: string): Promise<boolean> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fall through. Denied permission and an insecure origin both land here.
+    }
+  }
+
+  if (typeof document === "undefined") return false;
+  const pad = document.createElement("textarea");
+  pad.value = text;
+  pad.setAttribute("readonly", "");
+  pad.style.position = "fixed";
+  pad.style.top = "-1000px";
+  pad.style.opacity = "0";
+  document.body.appendChild(pad);
+  try {
+    pad.select();
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    document.body.removeChild(pad);
+  }
 }

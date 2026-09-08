@@ -18,6 +18,10 @@ export const dynamic = "force-dynamic";
  *   POST /api/leads/{search_id}/{key}/status
  *   POST /api/leads/search
  *   GET  /api/leads/jobs/{job_id}
+ *   GET  /api/leads/config
+ *   PUT  /api/leads/config
+ *   GET  /api/leads/{search_id}/export.csv          (CSV, not JSON)
+ *   GET  /api/leads/{search_id}/{key}/shot/{view}   (JPEG, not JSON)
  *
  * Same rules as app/api/prepare-context/route.ts: the browser never talks to
  * FastAPI directly, so there is no CORS surface and no backend URL in the client
@@ -126,7 +130,7 @@ function timeoutFor(segments: string[]): number {
 async function forward(
   request: Request,
   context: LeadsContext,
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "PUT",
 ): Promise<Response> {
   const { path } = await context.params;
   const segments = Array.isArray(path) ? path : [];
@@ -142,7 +146,7 @@ async function forward(
   }
 
   let body: string | undefined;
-  if (method === "POST") {
+  if (method !== "GET") {
     try {
       body = await request.text();
     } catch {
@@ -164,9 +168,9 @@ async function forward(
     upstream = await fetch(target, {
       method,
       headers:
-        method === "POST"
-          ? { "content-type": "application/json", accept: "application/json" }
-          : { accept: "application/json" },
+        method === "GET"
+          ? { accept: "*/*" }
+          : { "content-type": "application/json", accept: "application/json" },
       body,
       cache: "no-store",
       signal: AbortSignal.timeout(timeoutMs),
@@ -178,6 +182,25 @@ async function forward(
       hint: `Start the server first: ${START_COMMAND}`,
     };
     return Response.json(payload, { status: 502 });
+  }
+
+  /* Two of these endpoints do not answer in JSON: the screenshot is a JPEG and
+     the export is a CSV. Both are passed straight through, bytes untouched,
+     with the content type and the filename the backend chose. Reading either
+     one as text and re-encoding it would corrupt the image and strip the
+     download name off the export. */
+  const upstreamType = upstream.headers.get("content-type") ?? "";
+  if (upstream.ok && !upstreamType.includes("json")) {
+    const passthrough = new Headers();
+    passthrough.set("content-type", upstreamType || "application/octet-stream");
+    for (const name of ["content-disposition", "cache-control"]) {
+      const value = upstream.headers.get(name);
+      if (value) passthrough.set(name, value);
+    }
+    return new Response(await upstream.arrayBuffer(), {
+      status: upstream.status,
+      headers: passthrough,
+    });
   }
 
   const text = await upstream.text();
@@ -222,4 +245,9 @@ export async function GET(request: Request, context: LeadsContext): Promise<Resp
 /** Writes: build a call context, save an outcome, start a new scrape. */
 export async function POST(request: Request, context: LeadsContext): Promise<Response> {
   return forward(request, context, "POST");
+}
+
+/** The settings screen, which replaces a whole file rather than appending to it. */
+export async function PUT(request: Request, context: LeadsContext): Promise<Response> {
+  return forward(request, context, "PUT");
 }

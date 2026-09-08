@@ -392,7 +392,45 @@ export interface LeadRow {
   status: LeadStatus;
   /** ISO timestamp of the first call, or null when never called. */
   calledAt: string | null;
+  /**
+   * When to get to them: "now", "week" or "later".
+   *
+   * This is the decision the scoring step made, and `urgency` is the raw number
+   * behind it. The two can disagree, and where they do this one wins, because
+   * it is the one the engine's own dashboard sorted the day by.
+   */
+  priority: LeadPriority;
+  /** The whole deal over its life, one off fee plus the retainer. */
+  contractValue: number;
+  /** `contractValue` multiplied by the odds of closing it. */
+  expectedValue: number;
+  /** How many ready to send drafts the copywriter wrote. 0 when it never ran. */
+  messageCount: number;
 }
+
+/** When to get to a lead. The three lanes the work queue is built out of. */
+export type LeadPriority = "now" | "week" | "later";
+
+/** True when `v` is one of the three priorities. */
+export function isLeadPriority(v: unknown): v is LeadPriority {
+  return v === "now" || v === "week" || v === "later";
+}
+
+/** The words and the order the queue and the analytics screen both use. */
+export const PRIORITY_ORDER: LeadPriority[] = ["now", "week", "later"];
+
+export const PRIORITY_LABELS: Record<LeadPriority, string> = {
+  now: "Call today",
+  week: "This week",
+  later: "Later",
+};
+
+/** One line saying what each lane means, for the empty state and the tooltip. */
+export const PRIORITY_BLURBS: Record<LeadPriority, string> = {
+  now: "Something is badly broken and they are losing customers over it.",
+  week: "Worth a call, but nothing is on fire.",
+  later: "Their site is fine. Only worth a call when the list above is done.",
+};
 
 /**
  * One thing the audit found wrong, with the evidence.
@@ -473,6 +511,92 @@ export interface LeadDetail extends LeadRow {
   money: LeadMoney;
   /** Whatever the rep typed after the last call. Often an empty string. */
   notes: string;
+  /**
+   * The ready to send drafts the copywriter wrote for this business.
+   *
+   * The rep copies one and pastes it into whatever app that channel lives in.
+   * Nothing here is ever sent by this product. A cold email sent by a server is
+   * a different legal question from one a person sends, and the value of these
+   * is that a human reads them before anyone else does.
+   */
+  messages: LeadMessage[];
+  /**
+   * Which pictures of their site exist on this machine.
+   *
+   * Booleans, not links. The link is the same shape every time and the only
+   * thing the drawer cannot work out for itself is whether the file is really
+   * there. Asking the browser for one that is not gives the rep a broken frame
+   * instead of an honest "no picture".
+   */
+  screenshots: Partial<Record<LeadShotView, boolean>>;
+  /** Why the engine put them in this lane, in one line. */
+  urgencyReason: string;
+}
+
+/** The two pictures the audit takes of a prospect's website. */
+export type LeadShotView = "desktop" | "mobile";
+
+/** The three places the copywriter writes for. */
+export type LeadMessageChannel = "email" | "instagram" | "sms";
+
+export const MESSAGE_CHANNEL_LABELS: Record<LeadMessageChannel, string> = {
+  email: "Email",
+  instagram: "Instagram DM",
+  sms: "Text message",
+};
+
+/** One ready to send message. */
+export interface LeadMessage {
+  channel: LeadMessageChannel;
+  /** The email subject. An empty string for the two channels that have none. */
+  subject: string;
+  body: string;
+}
+
+/** The rep's own details, which go into every message the copywriter writes. */
+export interface LeadProfile {
+  [key: string]: unknown;
+  your_name?: string;
+  company?: string;
+  email?: string;
+  phone?: string;
+  whatsapp?: string;
+  city?: string;
+  portfolio_url?: string;
+  calendar_url?: string;
+  signature_note?: string;
+}
+
+/**
+ * Every number the deal maths runs on.
+ *
+ * Deliberately loose. This is the engine's own pricing file, the settings screen
+ * edits the handful of fields a rep actually changes, and everything else is
+ * carried through untouched so saving one field cannot drop the rest of a file
+ * this product did not write.
+ */
+export interface LeadPricing {
+  [key: string]: unknown;
+  currency_symbol?: string;
+  ltv_months?: number;
+  tiers?: Record<string, LeadPricingTier>;
+}
+
+/** One price band, matched to a business by the keywords in its category. */
+export interface LeadPricingTier {
+  [key: string]: unknown;
+  label?: string;
+  /** Low and high one off fee. */
+  website_price?: number[];
+  /** Low and high monthly retainer. */
+  retainer_monthly?: number[];
+  keywords?: string[];
+}
+
+/** Both settings files, from GET /api/leads/config. */
+export interface LeadConfig {
+  profile: LeadProfile;
+  pricing: LeadPricing;
 }
 
 /** How a background scrape is going. */

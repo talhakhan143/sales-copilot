@@ -34,7 +34,13 @@ import type {
   Difficulty,
   LeadCallSession,
   LeadDetail,
+  LeadConfig,
+  LeadMessage,
+  LeadMessageChannel,
   LeadMoney,
+  LeadPricing,
+  LeadProfile,
+  LeadShotView,
   LeadRow,
   LeadStatus,
   PainPoint,
@@ -46,6 +52,7 @@ import type {
 import {
   asLeadTrack,
   isDifficulty,
+  isLeadPriority,
   isLeadDetail,
   isLeadRow,
   isLeadStatus,
@@ -552,7 +559,7 @@ function unreadable(what: string): LeadsFailure {
  */
 async function request(
   path: string,
-  init: { method: "GET" | "POST"; body?: string },
+  init: { method: "GET" | "POST" | "PUT"; body?: string },
   ms: number,
   signal?: AbortSignal,
 ): Promise<{ kind: "ok"; payload: unknown } | LeadsFailure> {
@@ -602,9 +609,9 @@ function leadPath(searchId: string, key: string, tail: string = ""): string {
 /* ------------------------------------------------------------------ */
 
 /**
- * Fix the three fields whose shape is not settled, then hand the record on.
+ * Fix the fields whose shape is not settled, then hand the record on.
  *
- * Only three, and each for a stated reason:
+ * Each for a stated reason:
  *
  *   - `track`. The lead engine writes it in capitals and the contract writes it
  *     in title case, so it is folded to one of the three words this build knows.
@@ -612,6 +619,10 @@ function leadPath(searchId: string, key: string, tail: string = ""): string {
  *     no stars for yet, which is 2 of the 91 leads on disk. Null becomes 0, so
  *     the lead survives the guard and no component has to hold a null. A real
  *     rating is never 0, so nothing is lost by saying it this way.
+ *   - `priority` and the three numbers under it. These arrived later than the
+ *     rest, so a server that has not been restarted yet sends rows without
+ *     them. Defaulting here is what stops the work queue drawing an empty lane
+ *     and the analytics screen adding up a column of undefined.
  *
  * Everything else is left exactly as it arrived, so the guard is still judging
  * the server's real answer.
@@ -623,6 +634,10 @@ function normalizeWire(v: unknown): unknown {
     track: asLeadTrack(v.track),
     rating: asNumber(v.rating, 0),
     reviews: asNumber(v.reviews, 0),
+    priority: isLeadPriority(v.priority) ? v.priority : "later",
+    contractValue: asNumber(v.contractValue, 0),
+    expectedValue: asNumber(v.expectedValue, 0),
+    messageCount: asNumber(v.messageCount, 0),
   };
 }
 
@@ -668,10 +683,52 @@ const NO_PRICE_YET: LeadMoney = {
 function normalizeDetailWire(v: unknown): unknown {
   const folded = normalizeWire(v);
   if (!isRecord(folded)) return folded;
-  if (folded.money === null || folded.money === undefined) {
-    return { ...folded, money: { ...NO_PRICE_YET } };
+
+  /* The copy and the pictures both come from stages that may never have run, so
+     both default to "there is none" rather than to undefined. The drawer then
+     asks one question, is the list empty, instead of two. */
+  const filled: Record<string, unknown> = {
+    ...folded,
+    messages: readMessages(folded.messages),
+    screenshots: isRecord(folded.screenshots) ? folded.screenshots : {},
+    urgencyReason: isStr(folded.urgencyReason)
+      ? folded.urgencyReason
+      : isStr(folded.why)
+        ? folded.why
+        : "",
+  };
+  if (filled.money === null || filled.money === undefined) {
+    filled.money = { ...NO_PRICE_YET };
   }
-  return folded;
+  return filled;
+}
+
+/** The channels the copywriter writes for, checked before anything is drawn. */
+const MESSAGE_CHANNELS: LeadMessageChannel[] = ["email", "instagram", "sms"];
+
+/**
+ * Read the drafts, dropping anything that would paste as nothing.
+ *
+ * The rep presses copy and pastes straight into WhatsApp. A draft with an empty
+ * body is worse than a channel that is simply not offered, because the rep only
+ * finds out after they have pasted it to a real prospect.
+ */
+function readMessages(v: unknown): LeadMessage[] {
+  if (!Array.isArray(v)) return [];
+  const out: LeadMessage[] = [];
+  for (const item of v) {
+    if (!isRecord(item)) continue;
+    const channel = item.channel;
+    if (!MESSAGE_CHANNELS.includes(channel as LeadMessageChannel)) continue;
+    const body = isStr(item.body) ? plainText(item.body) : "";
+    if (!body) continue;
+    out.push({
+      channel: channel as LeadMessageChannel,
+      subject: isStr(item.subject) ? plainText(item.subject) : "",
+      body,
+    });
+  }
+  return out;
 }
 
 /** A row with every string the rep will read turned into plain words. */
@@ -1107,4 +1164,119 @@ export function orThrow<T extends { kind: "ok" }>(result: T | LeadsFailure): T {
     throw new Error(result.hint ? `${result.message} ${result.hint}` : result.message);
   }
   return result;
+}
+
+/* ------------------------------------------------------------------ */
+/* The rest of the lead engine: pictures, the export and the settings  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Where to point an `<img>` at one of the audit's screenshots.
+ *
+ * A plain URL and not a fetch, because the browser is far better at loading an
+ * image than we are: it streams it, caches it, and shows it the moment enough
+ * bytes have arrived. `LeadDetail.screenshots` already says whether the file is
+ * there, so this is only ever called for one that exists.
+ */
+export function screenshotUrl(searchId: string, key: string, view: LeadShotView): string {
+  return leadPath(searchId, key, `/shot/${encodeURIComponent(view)}`);
+}
+
+/**
+ * Where the whole calling list can be downloaded as a spreadsheet.
+ *
+ * A link the browser follows, not a fetch. Going through fetch would mean
+ * holding the file in memory and handing it back through a blob URL, and the
+ * download would lose the filename the server picked.
+ */
+export function exportUrl(searchId: string): string {
+  return `${BASE}/${encodeURIComponent(searchId.trim())}/export.csv`;
+}
+
+/** What `fetchConfig` and `saveConfig` give back. */
+export type LeadConfigResult = { kind: "ok"; config: LeadConfig } | LeadsFailure;
+
+/**
+ * Read the rep's own settings: who they are, and what they charge.
+ *
+ * Both halves default to an empty object rather than failing. A first run has
+ * no files yet, and the settings screen exists precisely to create them, so
+ * refusing to open it until they exist would be a locked door with the key
+ * inside.
+ */
+export async function fetchConfig(signal?: AbortSignal): Promise<LeadConfigResult> {
+  const answer = await request(`${BASE}/config`, { method: "GET" }, READ_TIMEOUT_MS, signal);
+  if (answer.kind === "error") return answer;
+  if (!isRecord(answer.payload)) return unreadable("your settings");
+  return {
+    kind: "ok",
+    config: {
+      profile: isRecord(answer.payload.profile) ? (answer.payload.profile as LeadProfile) : {},
+      pricing: isRecord(answer.payload.pricing) ? (answer.payload.pricing as LeadPricing) : {},
+    },
+  };
+}
+
+/**
+ * Write the settings back.
+ *
+ * Whole files, not patches, and only the halves that are passed. The screen
+ * loads both, edits the handful of fields a rep actually changes and sends the
+ * rest back untouched, so saving a name cannot drop a pricing tier this product
+ * never showed.
+ */
+export async function saveConfig(
+  patch: { profile?: LeadProfile; pricing?: LeadPricing },
+  signal?: AbortSignal,
+): Promise<LeadConfigResult> {
+  const body: Record<string, unknown> = {};
+  if (patch.profile) body.profile = patch.profile;
+  if (patch.pricing) body.pricing = patch.pricing;
+  if (Object.keys(body).length === 0) {
+    return { kind: "error", message: "There was nothing to save.", hint: null };
+  }
+
+  const answer = await request(
+    `${BASE}/config`,
+    { method: "PUT", body: JSON.stringify(body) },
+    READ_TIMEOUT_MS,
+    signal,
+  );
+  if (answer.kind === "error") return answer;
+  if (!isRecord(answer.payload)) return unreadable("your settings");
+  return {
+    kind: "ok",
+    config: {
+      profile: isRecord(answer.payload.profile) ? (answer.payload.profile as LeadProfile) : {},
+      pricing: isRecord(answer.payload.pricing) ? (answer.payload.pricing as LeadPricing) : {},
+    },
+  };
+}
+
+/**
+ * Which search the rep had open last.
+ *
+ * Shared, because there are four screens now that all open onto a search and a
+ * rep who picks one on the calling list and then presses Today should not have
+ * to pick it again. Losing it costs one click, so every path here fails quietly.
+ */
+const LAST_SEARCH_KEY = "salescopilot:leadSearch";
+
+export function readLastSearch(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const value = window.localStorage.getItem(LAST_SEARCH_KEY);
+    return value && value.trim().length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeLastSearch(id: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(LAST_SEARCH_KEY, id);
+  } catch {
+    // Storage is off. Losing which search was open costs one click.
+  }
 }

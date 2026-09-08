@@ -14,6 +14,7 @@ When serializing by hand, call ``model_dump(by_alias=True)`` or
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
@@ -978,6 +979,15 @@ class LeadRow(CamelModel):
         pain_count: How many problems the audit found on their site and listing.
         status: Where this lead is in the pipeline, one of :data:`LEAD_STATUSES`.
         called_at: When the rep last called, as an ISO 8601 string, or ``None``.
+        priority: ``now``, ``week`` or ``later``. When to get to them, which is
+            the number the work queue is built on. Urgency is the raw score
+            behind it and this is the decision, so screens read this one.
+        contract_value: The whole deal over its life, one off fee plus the
+            retainer for as many months as the pricing file says. This is what
+            the money columns add up, not ``deal_value``.
+        expected_value: The contract value multiplied by the odds of closing it.
+        message_count: How many ready to send drafts the copywriter wrote for
+            this lead. Zero when that stage has not run.
     """
 
     key: str
@@ -997,6 +1007,10 @@ class LeadRow(CamelModel):
     pain_count: int = 0
     status: str = DEFAULT_LEAD_STATUS
     called_at: str | None = None
+    priority: str = "later"
+    contract_value: int = 0
+    expected_value: int = 0
+    message_count: int = 0
 
     @field_validator("status", mode="before")
     @classmethod
@@ -1098,6 +1112,63 @@ class LeadDetail(LeadRow):
     gmb_url: str | None = None
     money: MoneyModel = Field(default_factory=MoneyModel)
     notes: str = ""
+    messages: list[MessageModel] = Field(default_factory=list)
+    screenshots: dict[str, bool] = Field(default_factory=dict)
+    urgency_reason: str = ""
+
+
+class MessageModel(CamelModel):
+    """One ready to send message the copywriter wrote for a lead.
+
+    The rep presses copy and pastes it into whatever app that channel lives in.
+    Nothing here is sent by this product, and nothing should be: a cold email
+    sent by a server is a different legal question from one the rep sends
+    themselves, and the whole point of these drafts is that a person reads them
+    before anyone else does.
+
+    Attributes:
+        channel: ``email``, ``instagram`` or ``sms``.
+        subject: The email subject. Empty string for the other two, which have
+            no such thing, rather than null, so the screen never checks.
+        body: The message itself.
+    """
+
+    channel: str
+    subject: str = ""
+    body: str = ""
+
+
+class LeadConfigResponse(CamelModel):
+    """The two files the settings screen owns.
+
+    Sent together because the screen shows them on one page and a rep who
+    changes their name and their prices in one sitting should not be able to
+    save half of it.
+
+    Attributes:
+        profile: Who the rep is. The name and email that go into every message.
+        pricing: Every number the deal maths uses, tiers included.
+    """
+
+    profile: dict[str, Any] = Field(default_factory=dict)
+    pricing: dict[str, Any] = Field(default_factory=dict)
+
+
+class LeadConfigRequest(CamelModel):
+    """Body of ``PUT /api/leads/config``.
+
+    Either half may be left out, which means leave that file alone. Sending an
+    empty object for one would otherwise be indistinguishable from not sending
+    it, and clearing a rep's whole pricing file by accident is not a mistake
+    worth allowing.
+
+    Attributes:
+        profile: The whole profile file, or ``None`` to leave it as it is.
+        pricing: The whole pricing file, or ``None`` to leave it as it is.
+    """
+
+    profile: dict[str, Any] | None = None
+    pricing: dict[str, Any] | None = None
 
 
 class LeadCallRequest(CamelModel):

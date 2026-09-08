@@ -38,10 +38,12 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, GraduationCap, Plus, TriangleAlert, X } from "lucide-react";
+import { ArrowLeft, Download, GraduationCap, Plus, TriangleAlert, X } from "lucide-react";
 
 import { CallChoice } from "@/components/CallChoice";
+import { LeadNav } from "@/components/LeadChrome";
 import { LeadDetail } from "@/components/LeadDetail";
+import { Notice } from "@/components/Notice";
 import { LeadList } from "@/components/LeadList";
 import { SearchPicker } from "@/components/SearchPicker";
 import {
@@ -50,8 +52,11 @@ import {
   fetchLead,
   fetchLeads,
   fetchSearches,
+  readLastSearch,
+  exportUrl,
   startLeadCall,
   startSearch,
+  writeLastSearch,
 } from "@/lib/leads";
 import type {
   Lead,
@@ -65,7 +70,7 @@ import type {
 import { DEFAULT_DIFFICULTY } from "@/lib/config";
 import { loadProfile } from "@/lib/profile";
 import { saveSession } from "@/lib/session";
-import type { CallMode, Difficulty, LeadCallSession } from "@/lib/types";
+import type { CallMode, Difficulty, LeadCallSession, LeadTrack } from "@/lib/types";
 
 /** How often the scrape job is asked what it is doing. */
 const POLL_MS = 2000;
@@ -77,7 +82,6 @@ const POLL_FAILS = 5;
 const DONE_MS = 8000;
 
 /** Which search was open last. A per browser convenience, never a source of truth. */
-const LAST_SEARCH_KEY = "salescopilot:leadSearch";
 
 const HOW_MANY = [20, 40, 60, 100];
 
@@ -146,50 +150,10 @@ function sentence(failure: LeadsFailure): string {
   return failure.hint ? `${failure.message} ${failure.hint}` : failure.message;
 }
 
-function readLastSearch(): string | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const value = window.localStorage.getItem(LAST_SEARCH_KEY);
-    return value && value.trim().length > 0 ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeLastSearch(id: string): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(LAST_SEARCH_KEY, id);
-  } catch {
-    // Storage is off. Losing which search was open costs one click.
-  }
-}
-
 /** Keep the wanted search when it still exists, otherwise fall to the newest. */
 function pickSearch(list: LeadSearch[], wanted: string | null): string | null {
   if (wanted && list.some((search) => search.id === wanted)) return wanted;
   return list.length > 0 ? list[0].id : null;
-}
-
-interface NoticeProps {
-  tone: "danger" | "warn";
-  text: string;
-  children?: ReactNode;
-}
-
-/** One notice, in the house shape: a rule down the left, an icon, one sentence. */
-function Notice({ tone, text, children }: NoticeProps) {
-  const border = tone === "danger" ? "border-danger" : "border-warn";
-  const icon = tone === "danger" ? "text-danger" : "text-warn";
-  return (
-    <div className={`flex gap-3 border-l-2 ${border} bg-surface-2 p-4`}>
-      <TriangleAlert aria-hidden="true" className={`mt-0.5 h-4 w-4 shrink-0 ${icon}`} />
-      <div className="flex min-w-0 flex-col gap-2">
-        <p className="text-body text-muted">{text}</p>
-        {children}
-      </div>
-    </div>
-  );
 }
 
 export default function LeadsPage() {
@@ -217,6 +181,7 @@ export default function LeadsPage() {
      drawer can send the rep to the tab that lead just moved to. */
   const [bucket, setBucket] = useState<LeadBucket>("to_call");
   const [phoneOnly, setPhoneOnly] = useState(false);
+  const [trackOnly, setTrackOnly] = useState<LeadTrack | "ALL">("ALL");
   const [sort, setSort] = useState<LeadSort>("value");
 
   const [detailKey, setDetailKey] = useState<string | null>(null);
@@ -633,11 +598,30 @@ export default function LeadsPage() {
   return (
     <div className="min-h-dvh bg-bg">
       <header className="sticky top-0 z-20 flex h-14 items-center justify-between gap-4 border-b border-line bg-bg/95 px-6">
-        <div className="flex items-center gap-3">
-          <span className="h-2 w-2 shrink-0 bg-accent animate-mark" aria-hidden="true" />
-          <span className="font-mono text-micro uppercase text-muted">Sales copilot</span>
+        <div className="flex min-w-0 items-center gap-4">
+          <div className="flex shrink-0 items-center gap-3">
+            <span className="h-2 w-2 shrink-0 bg-accent animate-mark" aria-hidden="true" />
+            <span className="font-mono text-micro uppercase text-muted">Sales copilot</span>
+          </div>
+          <span aria-hidden="true" className="h-3.5 w-px shrink-0 bg-line-strong" />
+          <LeadNav />
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
+          {/* The export takes the whole search, not the filtered view. A rep
+              exporting a list is taking it somewhere else, and a file that
+              silently dropped the rows behind whatever tab was open would be
+              worse than no export at all. */}
+          {searchId ? (
+            <a
+              href={exportUrl(searchId)}
+              download
+              title="Download every lead in this search as a spreadsheet"
+              className={MICRO_BUTTON}
+            >
+              <Download aria-hidden="true" className="h-3 w-3" />
+              Export
+            </a>
+          ) : null}
           {/* Practice lives on the setup page, and before this the only way to
               reach it was to leave the list, scroll past the lead panel and find
               a segmented control. A rep who spends the whole day here could not
@@ -810,9 +794,11 @@ export default function LeadsPage() {
               error={leadsError}
               bucket={bucket}
               phoneOnly={phoneOnly}
+              trackOnly={trackOnly}
               sort={sort}
               onBucket={setBucket}
               onPhoneOnly={setPhoneOnly}
+              onTrackOnly={setTrackOnly}
               onSort={setSort}
               onCall={askLead}
               onOpen={openDetail}
@@ -830,6 +816,7 @@ export default function LeadsPage() {
           loading={detailLoading}
           error={detailError}
           calling={callingKey === detailKey}
+          searchId={searchId ?? ""}
           onClose={closeDetail}
           onCall={callFromDrawer}
         />

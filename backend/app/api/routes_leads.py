@@ -39,15 +39,18 @@ wins.
 from __future__ import annotations
 
 import asyncio
+import csv
 import dataclasses
+import io
 import inspect
 import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Final
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.api.routes_context import get_groq
@@ -60,8 +63,11 @@ from app.models import (
     JobStatusResponse,
     LeadCallRequest,
     LeadCallResponse,
+    LeadConfigRequest,
+    LeadConfigResponse,
     LeadDetail,
     LeadRow,
+    MessageModel,
     LeadsResponse,
     LeadStatusRequest,
     LeadStatusResponse,
@@ -695,7 +701,61 @@ def _row_fields(source: object) -> dict[str, Any]:
         "pain_count": _int_field(source, "painCount", "pain_count"),
         "status": _str_field(source, "status", default=DEFAULT_LEAD_STATUS),
         "called_at": _opt_str_field(source, "calledAt", "called_at", "contactedAt", "contacted_at"),
+        "priority": _priority_field(source),
+        # The money the queue and the analytics screens add up. The list shape
+        # carries these flat and the drawer carries them inside the money block,
+        # so both are tried, flat first. Reading only the block gave every list
+        # row a zero contract, which quietly zeroed the whole analytics screen.
+        "contract_value": _money_number(source, "contractValue", "contract_value_usd"),
+        "expected_value": _money_number(source, "expectedValue", "expected_value_usd"),
     }
+
+
+def _money_number(source: object, flat: str, nested: str) -> int:
+    """Read one money figure from wherever this shape happens to keep it.
+
+    Args:
+        source: The lead's merged mapping.
+        flat: The camelCase name on a list row.
+        nested: The snake_case name inside the money block.
+
+    Returns:
+        The number, or 0 when neither shape has it.
+    """
+    direct = _int_field(source, flat)
+    if direct:
+        return direct
+    return _int_field(_readable(_field(source, "money")), nested)
+
+
+#: What the scoring step calls the three answers to "when do I get to them".
+_PRIORITIES: Final[frozenset[str]] = frozenset({"now", "week", "later"})
+
+
+def _priority_field(source: object) -> str:
+    """Read when to contact this lead, falling back to the urgency behind it.
+
+    The scoring step writes ``priority`` and every lead it scored has one. A
+    lead from a search whose scoring never ran has none, and putting all of
+    those in "now" would drown the queue on the one screen that exists to say
+    what to do first. So an unscored lead is derived from urgency and lands in
+    "later" when even that is missing.
+
+    Args:
+        source: The lead's merged mapping, or the lead object itself.
+
+    Returns:
+        One of ``now``, ``week`` or ``later``.
+    """
+    raw = str(_str_field(source, "priority") or "").strip().lower()
+    if raw in _PRIORITIES:
+        return raw
+    urgency = _int_field(source, "urgency")
+    if urgency >= 4:
+        return "now"
+    if urgency >= 2:
+        return "week"
+    return "later"
 
 
 def _lead_row(lead: object) -> LeadRow:
@@ -812,16 +872,23 @@ def _money(source: object) -> MoneyModel:
     )
 
 
-def _lead_detail(lead: object) -> LeadDetail:
+def _lead_detail(lead: object, search_id: str = "") -> LeadDetail:
     """Shape one lead into the full drawer object.
 
     Args:
         lead: Whatever the lead service returned.
+        search_id: The search the lead came from. Needed for the two things that
+            live in their own files rather than on the lead: the copywriter's
+            drafts and the screenshots. Left empty by callers that only want the
+            lead itself, such as the call context builder, and both then come
+            back empty rather than being looked up.
 
     Returns:
         The wire model, which is the list row plus everything the drawer shows.
     """
     source = _readable(lead)
+    key = _str_field(source, "key", "lead_key", "leadKey")
+    drafts = _messages(search_id, key)
     return LeadDetail(
         **_row_fields(source),
         pain_points=_pain_points(source),
@@ -831,7 +898,75 @@ def _lead_detail(lead: object) -> LeadDetail:
         gmb_url=_opt_str_field(source, "gmbUrl", "gmb_url"),
         money=_money(source),
         notes=_str_field(source, "notes"),
+        urgency_reason=_str_field(source, "urgencyReason", "urgency_reason", "why"),
+        messages=drafts,
+        screenshots=_screenshots(search_id, key),
+        message_count=len(drafts),
     )
+
+
+def _messages(search_id: str, key: str) -> list[MessageModel]:
+    """Read the copywriter's drafts for one lead.
+
+    Args:
+        search_id: The search slug, or empty to skip the lookup entirely.
+        key: The lead key.
+
+    Returns:
+        Every draft, in channel order. Empty when the copywriter never ran,
+        which is a normal state and never an error.
+    """
+    if not search_id or not key:
+        return []
+    reader = _lookup(leads_service, ("messages_for",))
+    if reader is None:
+        return []
+    try:
+        drafts = reader(search_id, key)
+    except Exception:  # noqa: BLE001 - missing copy never blocks the drawer.
+        log.exception("reading messages for %s failed", key)
+        return []
+    out: list[MessageModel] = []
+    for draft in drafts or ():
+        item = _readable(draft)
+        body = _str_field(item, "body")
+        if body:
+            out.append(
+                MessageModel(
+                    channel=_str_field(item, "channel"),
+                    subject=_str_field(item, "subject"),
+                    body=body,
+                )
+            )
+    return out
+
+
+def _screenshots(search_id: str, key: str) -> dict[str, bool]:
+    """Say which pictures of this lead's site are on disk.
+
+    Booleans and not URLs, because the URL is the same shape every time and the
+    only thing the drawer cannot work out for itself is whether the image is
+    really there. Asking the browser to load one that is not gives the rep a
+    broken frame instead of an honest "no picture".
+
+    Args:
+        search_id: The search slug, or empty to skip the lookup.
+        key: The lead key.
+
+    Returns:
+        View name to whether it exists.
+    """
+    if not search_id or not key:
+        return {}
+    reader = _lookup(leads_service, ("has_screenshots",))
+    if reader is None:
+        return {}
+    try:
+        found = reader(search_id, key)
+    except Exception:  # noqa: BLE001 - a missing picture is not a failure.
+        log.exception("looking for screenshots of %s failed", key)
+        return {}
+    return found if isinstance(found, dict) else {}
 
 
 # ====================================================================== #
@@ -1062,6 +1197,64 @@ async def get_job(job_id: str) -> JobStatusResponse:
 # ====================================================================== #
 
 
+@router.get("/config", response_model=LeadConfigResponse)
+async def get_lead_config() -> LeadConfigResponse:
+    """Read the two files the settings screen owns.
+
+    Declared above ``/{search_id}`` on purpose. Route order decides which
+    pattern wins, and a search id matches literally anything, so a settings
+    request registered after it would be answered as "no search called config".
+
+    Returns:
+        The rep's profile and the whole pricing file. Missing files come back as
+        empty objects, which is a first run rather than a failure.
+
+    Raises:
+        HTTPException: 503 when the lead service is not installed.
+    """
+    reader = _need(leads_service, ("read_config",), LEADS_OFF, "app.services.leads")
+    try:
+        profile = await _call_io(reader, "profile")
+        pricing = await _call_io(reader, "pricing")
+    except Exception:  # noqa: BLE001 - an unreadable settings file is not a crash.
+        log.exception("reading the lead engine config failed")
+        raise HTTPException(status_code=503, detail=LEADS_OFF) from None
+    return LeadConfigResponse(
+        profile=profile if isinstance(profile, dict) else {},
+        pricing=pricing if isinstance(pricing, dict) else {},
+    )
+
+
+@router.put("/config", response_model=LeadConfigResponse)
+async def put_lead_config(payload: LeadConfigRequest) -> LeadConfigResponse:
+    """Write the settings back.
+
+    Each half is written only when it was sent, so a screen that edits the
+    profile cannot blank the pricing file by leaving it out of the body.
+
+    Args:
+        payload: Either half of the settings, or both.
+
+    Returns:
+        Both files as they now stand on disk, so the screen redraws from what
+        was really saved rather than from what it hoped it saved.
+
+    Raises:
+        HTTPException: 400 when a file cannot be written, 503 when the lead
+            service is not installed.
+    """
+    writer = _need(leads_service, ("write_config",), LEADS_OFF, "app.services.leads")
+    try:
+        if payload.profile is not None:
+            await _call_io(writer, "profile", payload.profile)
+        if payload.pricing is not None:
+            await _call_io(writer, "pricing", payload.pricing)
+    except Exception as exc:  # noqa: BLE001 - the message says what went wrong.
+        log.exception("saving the lead engine config failed")
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return await get_lead_config()
+
+
 @router.get("/{search_id}", response_model=LeadsResponse)
 async def get_leads(
     search_id: str,
@@ -1113,7 +1306,159 @@ async def get_leads(
     # the route does not care which of the two the service hands over.
     raw_leads = page if isinstance(page, (list, tuple)) else _rows(page, "leads")
     rows = [_lead_row(lead) for lead in raw_leads]
+
+    # How many drafts the copywriter wrote, stamped on the rows in one pass. The
+    # file is read once for the whole search and cached, so this is a dictionary
+    # lookup per row rather than sixty five file reads.
+    counts = _message_counts(clean_id)
+    if counts:
+        for row in rows:
+            row.message_count = counts.get(row.key, 0)
+
     return LeadsResponse(search_id=clean_id, leads=[row for row in rows if row.key])
+
+
+def _message_counts(search_id: str) -> dict[str, int]:
+    """How many ready to send drafts each lead in a search has.
+
+    Args:
+        search_id: The search slug, already cleaned.
+
+    Returns:
+        Lead key to draft count. Empty when the copywriter never ran, which is
+        normal and is why nothing here raises.
+    """
+    counter = _lookup(leads_service, ("message_counts",))
+    if counter is None:
+        return {}
+    try:
+        result = counter(search_id)
+    except Exception:  # noqa: BLE001 - missing copy is never worth a 500.
+        log.exception("counting messages for %s failed", search_id)
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
+@router.get("/{search_id}/export.csv")
+async def get_lead_csv(search_id: str) -> Response:
+    """Hand the whole calling list back as a spreadsheet.
+
+    Declared above ``/{search_id}/{key}`` so ``export.csv`` is not read as a
+    lead key.
+
+    Every row the search holds, not the filtered view: the rep exporting a list
+    is taking it somewhere else, and a file that quietly dropped the rows behind
+    whatever tab happened to be open would be worse than useless.
+
+    Args:
+        search_id: The search slug.
+
+    Returns:
+        A CSV download named after the search.
+
+    Raises:
+        HTTPException: 404 when the search is unknown, 503 when the lead
+            service is not installed.
+    """
+    clean_id = _clean_search_id(search_id)
+    lister = _need(leads_service, ("leads_page",), LEADS_OFF, "app.services.leads")
+    try:
+        page = await _call_io(lister, clean_id)
+    except Exception:  # noqa: BLE001 - a broken file is not a crash.
+        log.exception("exporting %s failed", clean_id)
+        raise HTTPException(status_code=503, detail=LEADS_OFF) from None
+    if page is None:
+        raise HTTPException(status_code=404, detail=UNKNOWN_SEARCH)
+
+    raw_leads = page if isinstance(page, (list, tuple)) else _rows(page, "leads")
+    rows = [_lead_row(lead) for lead in raw_leads]
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        [
+            "Name", "Category", "City", "Phone", "Website", "Rating", "Reviews",
+            "Track", "Priority", "Urgency", "Score", "Deal value", "Contract value",
+            "Status", "Called at", "Why",
+        ]
+    )
+    for row in rows:
+        if not row.key:
+            continue
+        writer.writerow(
+            [
+                row.name, row.category, row.city, row.phone or "", row.website or "",
+                row.rating if row.rating is not None else "", row.reviews,
+                row.track, row.priority, row.urgency, row.lead_score,
+                row.deal_value, row.contract_value, row.status, row.called_at or "",
+                row.why,
+            ]
+        )
+
+    # The BOM is for Excel. Without it Excel reads UTF-8 as its own local code
+    # page and a business called "Café" arrives mangled, which is exactly the
+    # kind of thing that makes a rep stop trusting the export.
+    body = "\ufeff" + buffer.getvalue()
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{clean_id}.csv"'},
+    )
+
+
+@router.get("/{search_id}/{key}/shot/{view}")
+async def get_lead_screenshot(search_id: str, key: str, view: str) -> Response:
+    """Serve one of the pictures the audit took of a lead's site.
+
+    The file is found by rebuilding its name from the lead key, never by the
+    path stored in the audit file. That path was written on whichever machine
+    ran the scrape and points at a drive that does not exist here, and trusting
+    a path out of a data file to name a file to serve is how a reader of leads
+    becomes a reader of anything on the disk.
+
+    Args:
+        search_id: The search slug.
+        key: The lead key.
+        view: ``desktop`` or ``mobile``.
+
+    Returns:
+        The JPEG.
+
+    Raises:
+        HTTPException: 400 for a bad view, 404 when there is no such picture,
+            503 when the lead service is not installed.
+    """
+    clean_id = _clean_search_id(search_id)
+    clean_key = _clean_lead_key(key)
+    finder = _need(leads_service, ("screenshot_path",), LEADS_OFF, "app.services.leads")
+    try:
+        path = await _call_io(finder, clean_id, clean_key, view)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except Exception:  # noqa: BLE001 - a missing picture is not a crash.
+        log.exception("reading the screenshot for %s failed", clean_key)
+        raise HTTPException(status_code=503, detail=LEADS_OFF) from None
+
+    if path is None:
+        raise HTTPException(
+            status_code=404,
+            detail="There is no picture of this one's site.",
+        )
+    try:
+        blob = await _call_io(Path(path).read_bytes)
+    except OSError:
+        raise HTTPException(
+            status_code=404,
+            detail="There is no picture of this one's site.",
+        ) from None
+
+    # Cached hard: the audit writes these once and never touches them again, and
+    # the drawer opens the same two images every time the rep reopens a lead.
+    return Response(
+        content=blob,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
 
 
 @router.get("/{search_id}/{key}", response_model=LeadDetail)
@@ -1134,7 +1479,7 @@ async def get_lead(search_id: str, key: str) -> LeadDetail:
     """
     clean_id = _clean_search_id(search_id)
     clean_key = _clean_lead_key(key)
-    return _lead_detail(await _load_lead(clean_id, clean_key))
+    return _lead_detail(await _load_lead(clean_id, clean_key), clean_id)
 
 
 @router.post("/{search_id}/{key}/call", response_model=LeadCallResponse)

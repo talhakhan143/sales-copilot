@@ -31,7 +31,7 @@ import { TriangleAlert } from "lucide-react";
 
 import { LeadRow } from "@/components/LeadRow";
 import { BUCKET_EMPTY, BUCKET_LABELS, SORT_LABELS, bucketOf, canCall } from "@/lib/leads";
-import type { Lead, LeadBucket, LeadSort } from "@/lib/leads";
+import type { Lead, LeadBucket, LeadSort, LeadTrack } from "@/lib/leads";
 
 export interface LeadListProps {
   /** Every lead in the selected search, in the order the server sent them. */
@@ -44,10 +44,21 @@ export interface LeadListProps {
   bucket: LeadBucket;
   /** Hide the leads with no number, because those cannot be dialled. */
   phoneOnly: boolean;
+  /**
+   * Show only one kind of conversation, or all of them.
+   *
+   * Selling a first website and selling the work to make an existing one earn
+   * are different calls, and a rep who has warmed up on one does better staying
+   * on it. This is a select and not another row of tabs because it is the
+   * second question, not the first: the tabs are where a lead is up to, and
+   * this is what it is.
+   */
+  trackOnly: LeadTrack | "ALL";
   /** The sort cell that is on. */
   sort: LeadSort;
   onBucket(bucket: LeadBucket): void;
   onPhoneOnly(next: boolean): void;
+  onTrackOnly(next: LeadTrack | "ALL"): void;
   onSort(sort: LeadSort): void;
   onCall(lead: Lead): void;
   onOpen(lead: Lead): void;
@@ -126,10 +137,23 @@ function isEditable(node: unknown): boolean {
 }
 
 /** Does this lead belong in the list under the chip that is on. */
-function matches(lead: Lead, bucket: LeadBucket, phoneOnly: boolean): boolean {
+function matches(
+  lead: Lead,
+  bucket: LeadBucket,
+  phoneOnly: boolean,
+  trackOnly: LeadTrack | "ALL",
+): boolean {
   if (phoneOnly && !canCall(lead)) return false;
+  if (trackOnly !== "ALL" && lead.track !== trackOnly) return false;
   return bucketOf(lead.status) === bucket;
 }
+
+/** The three answers to "what am I selling today". */
+const TRACK_CHOICES: { value: LeadTrack | "ALL"; label: string }[] = [
+  { value: "ALL", label: "Everything" },
+  { value: "WEBSITE", label: "Needs a website" },
+  { value: "SEO", label: "Has a website" },
+];
 
 export function LeadList({
   leads,
@@ -137,9 +161,11 @@ export function LeadList({
   error,
   bucket,
   phoneOnly,
+  trackOnly,
   sort,
   onBucket,
   onPhoneOnly,
+  onTrackOnly,
   onSort,
   onCall,
   onOpen,
@@ -176,13 +202,14 @@ export function LeadList({
     return () => window.removeEventListener("keydown", onKey);
   }, [focusFilter]);
 
-  const shown = leads.filter((lead) => matches(lead, bucket, phoneOnly));
+  const shown = leads.filter((lead) => matches(lead, bucket, phoneOnly, trackOnly));
 
   /* Every tab carries its own count, so the rep can see there are three left to
      ring back without having to click onto that tab to find out. */
   const counts: Record<LeadBucket, number> = { to_call: 0, callback: 0, done: 0 };
   for (const lead of leads) {
     if (phoneOnly && !canCall(lead)) continue;
+    if (trackOnly !== "ALL" && lead.track !== trackOnly) continue;
     counts[bucketOf(lead.status)] += 1;
   }
   const total = leads.length;
@@ -261,6 +288,22 @@ export function LeadList({
             ) : null}
             Has phone
           </button>
+
+          <select
+            aria-label="What you are selling"
+            value={trackOnly}
+            onChange={(event) => onTrackOnly(event.target.value as LeadTrack | "ALL")}
+            title="Show only the businesses you would sell the same thing to"
+            className={`h-[26px] shrink-0 rounded-hair border border-line-strong px-2 font-mono text-micro uppercase ${
+              trackOnly === "ALL" ? "bg-surface text-muted" : "bg-surface-2 text-text"
+            }`}
+          >
+            {TRACK_CHOICES.map((choice) => (
+              <option key={choice.value} value={choice.value}>
+                {choice.label}
+              </option>
+            ))}
+          </select>
         </div>
 
         <div className="flex flex-wrap items-center gap-3">

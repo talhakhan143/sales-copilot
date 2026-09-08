@@ -83,7 +83,7 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1070,6 +1070,13 @@ class Lead:
             "painCount": self.pain_count,
             "status": self.status,
             "calledAt": self.called_at,
+            # On the row and not only in the drawer, because the work queue and
+            # the analytics screen are built entirely out of the list. Asking
+            # them to open sixty five drawers to add up the money would be a
+            # different product.
+            "priority": self.priority or "later",
+            "contractValue": self.money.contract_value_usd,
+            "expectedValue": self.money.expected_value_usd,
         }
         if not full:
             return wire
@@ -2228,3 +2235,262 @@ def _self_test() -> int:  # pragma: no cover - developer tool
 
 if __name__ == "__main__":  # pragma: no cover - developer tool
     raise SystemExit(_self_test())
+
+
+# --------------------------------------------------------------------------
+# The rest of the lead engine: outreach copy, screenshots and the config files
+#
+# None of this is needed to make a call, which is why it arrived late. It is
+# needed to replace the rep's old dashboard, which is the point: they should not
+# have to keep two windows open to work one list.
+# --------------------------------------------------------------------------
+
+#: Channels the copywriter writes for, in the order the drawer shows them.
+MESSAGE_CHANNELS: Final[tuple[str, ...]] = ("email", "instagram", "sms")
+
+#: Which screenshots the audit takes of a prospect's site.
+SHOT_VIEWS: Final[tuple[str, ...]] = ("desktop", "mobile")
+
+
+@dataclass(frozen=True, slots=True)
+class MessageDraft:
+    """One ready to send message the copywriter wrote for a lead.
+
+    Attributes:
+        channel: One of :data:`MESSAGE_CHANNELS`.
+        subject: The email subject. Empty for the channels that have none.
+        body: What to send.
+    """
+
+    channel: str
+    subject: str
+    body: str
+
+
+def _messages_path(search_id: str) -> Path:
+    """Where the copywriter's output for a search lives."""
+    return _search_path(search_id, ".messages.json")
+
+
+def _shots_dir() -> Path:
+    """Where the audit saves the screenshots it takes."""
+    return data_dir() / "screenshots"
+
+
+def messages_for(search_id: str, key: str) -> list[MessageDraft]:
+    """Read the ready to send messages for one lead.
+
+    The copywriter runs as its own stage and may not have run at all, so an
+    empty list is a normal answer and never an error.
+
+    A draft with no body is dropped rather than shown. The rep presses copy and
+    pastes straight into WhatsApp, so an empty paste is worse than a channel
+    that is simply not offered.
+
+    Args:
+        search_id: The search slug.
+        key: The lead key.
+
+    Returns:
+        Every draft found, grouped by channel in :data:`MESSAGE_CHANNELS` order.
+
+    Raises:
+        LeadError: When the search id or the lead key is not one we accept.
+    """
+    if not valid_search_id(search_id):
+        raise LeadError("That search name is not one we know.")
+    lead_key = _require_lead_key(key)
+
+    table = _load_cached(_messages_path(search_id), _parse_json_mapping, {})
+    entry = table.get(lead_key)
+    if not isinstance(entry, dict):
+        return []
+
+    drafts: list[MessageDraft] = []
+    for channel in MESSAGE_CHANNELS:
+        raw = entry.get(channel)
+        if not isinstance(raw, list):
+            continue
+        for item in raw:
+            # Email arrives as {subject, body}, the other two as a bare string.
+            if isinstance(item, dict):
+                subject = clean_text(item.get("subject"), limit=300)
+                body = clean_text(item.get("body"), limit=MAX_TEXT_CHARS)
+            else:
+                subject = ""
+                body = clean_text(item, limit=MAX_TEXT_CHARS)
+            if body:
+                drafts.append(MessageDraft(channel=channel, subject=subject, body=body))
+    return drafts
+
+
+def screenshot_path(search_id: str, key: str, view: str) -> Path | None:
+    """Find the screenshot the audit took of a lead's site.
+
+    The path stored in the audit file is not used. It was written on the machine
+    that ran the scrape, so on this one it reads like
+    ``E:\\Claude CLI Work\\...\\0x89c2...-desktop.jpg`` and resolves to nothing.
+    Only the shape of the name is portable, so the name is rebuilt from the lead
+    key and looked up in this machine's screenshots directory. That also means a
+    file cannot be requested from outside that directory no matter what the
+    audit file says.
+
+    Args:
+        search_id: The search slug, checked but not part of the file name.
+        key: The lead key, whose two halves are the file name.
+        view: ``desktop`` or ``mobile``.
+
+    Returns:
+        The path when the image is really there, otherwise ``None``.
+
+    Raises:
+        LeadError: When the search id, the lead key or the view is not one we
+            accept.
+    """
+    if not valid_search_id(search_id):
+        raise LeadError("That search name is not one we know.")
+    lead_key = _require_lead_key(key)
+    wanted = str(view or "").strip().lower()
+    if wanted not in SHOT_VIEWS:
+        raise LeadError("That is not a picture we take. Ask for desktop or mobile.")
+
+    # The audit names files with an underscore where the key has a colon.
+    stem = lead_key.replace(":", "_")
+    path = _shots_dir() / f"{stem}-{wanted}.jpg"
+    try:
+        if path.is_file():
+            return path
+    except OSError:
+        return None
+    return None
+
+
+def has_screenshots(search_id: str, key: str) -> dict[str, bool]:
+    """Say which of a lead's screenshots exist on this machine.
+
+    Args:
+        search_id: The search slug.
+        key: The lead key.
+
+    Returns:
+        One boolean per view in :data:`SHOT_VIEWS`.
+    """
+    out: dict[str, bool] = {}
+    for view in SHOT_VIEWS:
+        try:
+            out[view] = screenshot_path(search_id, key, view) is not None
+        except LeadError:
+            out[view] = False
+    return out
+
+
+def config_dir() -> Path:
+    """Where the lead engine keeps the files the rep owns.
+
+    Sibling of the data directory, which is how the engine lays itself out:
+    ``leadengine/data`` for what it produced, ``leadengine/config`` for what the
+    rep told it.
+
+    Returns:
+        The directory, which may not exist.
+    """
+    return data_dir().parent / "config"
+
+
+#: The config files the settings screen may read and write, and nothing else.
+#: A whitelist rather than a path join, so no request can name its way out.
+CONFIG_FILES: Final[dict[str, str]] = {
+    "profile": "profile.json",
+    "pricing": "pricing.json",
+}
+
+
+def read_config(name: str) -> dict[str, Any]:
+    """Read one of the rep's config files.
+
+    Args:
+        name: ``profile`` or ``pricing``.
+
+    Returns:
+        The parsed file, or an empty mapping when it is missing or unreadable.
+        A missing config is a first run, not a failure.
+
+    Raises:
+        LeadError: When ``name`` is not one of :data:`CONFIG_FILES`.
+    """
+    filename = CONFIG_FILES.get(str(name or "").strip().lower())
+    if filename is None:
+        raise LeadError("That is not a settings file we know.")
+    return _load_cached(config_dir() / filename, _parse_json_mapping, {})
+
+
+def write_config(name: str, data: Mapping[str, Any]) -> dict[str, Any]:
+    """Write one of the rep's config files back.
+
+    Written to a temp file and renamed, the same way the pipeline is, so a
+    crash halfway through cannot leave the rep with a settings file the engine
+    can no longer parse and a scrape that will not start.
+
+    The ``_comment`` key every one of these files carries is preserved even
+    though nothing shows it, because the rep also opens these in an editor.
+
+    Args:
+        name: ``profile`` or ``pricing``.
+        data: The whole file, not a patch.
+
+    Returns:
+        What was written.
+
+    Raises:
+        LeadError: When the name is unknown or the file cannot be written.
+    """
+    key = str(name or "").strip().lower()
+    filename = CONFIG_FILES.get(key)
+    if filename is None:
+        raise LeadError("That is not a settings file we know.")
+    if not isinstance(data, Mapping):
+        raise LeadError("Settings have to be sent as an object.")
+
+    merged = dict(read_config(key))
+    merged.update(dict(data))
+
+    target = config_dir() / filename
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_suffix(target.suffix + ".tmp")
+        temp.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+        temp.replace(target)
+    except OSError as exc:
+        raise LeadError(f"Could not save the settings: {exc}") from exc
+
+    clear_cache()
+    return merged
+
+
+def message_counts(search_id: str) -> dict[str, int]:
+    """How many drafts the copywriter wrote for each lead in a search.
+
+    One read of one cached file for the whole list, so the calling list can show
+    which businesses already have copy ready without asking per row.
+
+    Args:
+        search_id: The search slug.
+
+    Returns:
+        Lead key to draft count. Empty when that stage never ran.
+    """
+    if not valid_search_id(search_id):
+        return {}
+    table = _load_cached(_messages_path(search_id), _parse_json_mapping, {})
+    out: dict[str, int] = {}
+    for key, entry in table.items():
+        if not isinstance(entry, dict):
+            continue
+        total = 0
+        for channel in MESSAGE_CHANNELS:
+            raw = entry.get(channel)
+            if isinstance(raw, list):
+                total += sum(1 for item in raw if item)
+        if total:
+            out[str(key)] = total
+    return out
